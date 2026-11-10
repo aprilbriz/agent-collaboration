@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Claude Code host 세션의 native inbox로 완료 알림 한 줄을 보낸다.
+
+host가 자기 Bash에서 받은 CLAUDE_CODE_MESSAGING_SOCKET 경로를 --socket으로 받는다.
+socket이 연결을 받고 frame을 끝까지 쓰면 "sent"를 출력한다. 이것은 전송 접수일 뿐이며
+host의 수신 정책(crossSessionInbound)에 따른 전달 여부나 회신 검증 완료를 뜻하지 않는다.
+"""
+import argparse
+import json
+import os
+import socket
+import stat
+import sys
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--socket", required=True, help="host의 CLAUDE_CODE_MESSAGING_SOCKET 절대경로")
+    ap.add_argument("--message", required=True, help="회신 문서 절대경로를 포함한 알림 문장")
+    ap.add_argument("--timeout", type=float, default=5.0)
+    args = ap.parse_args()
+
+    message = args.message.strip()
+    if not message:
+        print("notify-claude: 빈 메시지는 보내지 않습니다", file=sys.stderr)
+        return 2
+    try:
+        if not stat.S_ISSOCK(os.stat(args.socket).st_mode):
+            print(f"notify-claude: socket이 아닙니다: {args.socket}", file=sys.stderr)
+            return 2
+    except OSError as e:
+        print(f"notify-claude: socket 확인 실패: {args.socket}: {e}", file=sys.stderr)
+        return 2
+
+    frame = json.dumps(
+        {"type": "user", "message": {"role": "user", "content": message}},
+        ensure_ascii=False,
+    )
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(args.timeout)
+            conn.connect(args.socket)
+            # POSIX에서 auth line은 선택이므로 보내지 않는다.
+            conn.sendall((frame + "\n").encode("utf-8"))
+            conn.shutdown(socket.SHUT_WR)
+            try:
+                conn.recv(1)
+            except OSError:
+                pass
+    except OSError as e:
+        print(f"notify-claude: 전송 실패: {e}", file=sys.stderr)
+        return 1
+    print(f"sent: {args.socket} (전송 접수만 확인; 전달·회신 검증은 host가 확인)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

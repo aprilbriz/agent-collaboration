@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""전용 worker terminal을 Orca 또는 tmux에서 만들고, 요청 한 줄을 보내고, 확인·종료한다.
+
+worker에게 보내는 입력은 항상 "<요청서 절대경로> — RULES.md 준수" 한 줄이다.
+이 helper는 자신이 만든 terminal(Orca handle, tmux `collab-` session의 pane)만 다룬다.
+tmux handle은 worker가 실행된 pane id(`%N`)라서 사용자가 창을 바꿔도 같은 worker를 가리킨다.
+전송 결과는 입력 접수일 뿐이며 작업 완료는 회신 파일로 판단한다.
+"""
+import argparse
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+TMUX_PREFIX = "collab-"
+# 전용 worker에만 기존처럼 권한 우회를 기본 적용한다. host·전역 설정과 model은 바꾸지 않는다.
+WORKER_DEFAULT_ARGS = {
+    "claude": ["--dangerously-skip-permissions"],
+    "codex": ["--dangerously-bypass-approvals-and-sandbox"],
+}
+
+
+def fail(msg: str, code: int = 2):
+    print(f"collab-worker: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def request_line(request: str) -> str:
+    return f"{request} — RULES.md 준수"
+
+
+def check_request(request: str) -> str:
+    p = Path(request)
+    if not p.is_absolute():
+        fail(f"요청서는 절대경로여야 합니다: {request}")
+    if not p.is_file():
+        fail(f"요청서가 없습니다: {request}")
+    rules = p.parent.parent / "RULES.md"
+    if not rules.is_file():
+        fail(f"comm dir에 RULES.md가 없습니다: {rules} (bin/collab-init으로 연결)")
+    return str(p)
+
+
+def run(cmd, dry: bool, capture: bool = True):
+    if dry:
+        print("+ " + shlex.join(cmd))
+        return None
+    res = subprocess.run(cmd, capture_output=capture, text=True)
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout or "").strip()
+        fail(f"명령 실패({res.returncode}): {shlex.join(cmd)}\n{detail}", 1)
+    return res.stdout
+
+
+def orca_json(cmd, dry: bool):
+    out = run(cmd, dry)
+    if out is None:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        fail(f"orca JSON 해석 실패: {out[:500]}", 1)
+    if isinstance(data, dict) and data.get("ok") is False:
+        fail(f"orca 오류: {json.dumps(data.get('error'), ensure_ascii=False)}", 1)
+    return data
+
+
+def find_key(data, key):
+    if isinstance(data, dict):
+        if isinstance(data.get(key), str):
+            return data[key]
+        for v in data.values():
+            found = find_key(v, key)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for v in data:
+            found = find_key(v, key)
+            if found:
+                return found
+    return None
+
+
+def slug(text: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^A-Za-z0-9_-]", "-", text)).strip("-")[:24]
+
+
+def tmux_session_of(handle: str) -> str:
+    """pane handle이 이 helper가 만든 session에 있는지 확인하고 session 이름을 돌려준다."""
+    if not re.fullmatch(r"%\d+", handle):
+        fail(f"tmux handle은 start가 돌려준 pane id(%N)여야 합니다: {handle}")
+    res = subprocess.run(["tmux", "display-message", "-p", "-t", handle, "#{session_name}"],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        fail(f"tmux pane이 없습니다: {handle}", 1)
+    name = res.stdout.strip()
+    if not name.startswith(TMUX_PREFIX):
+        fail(f"이 helper가 만든 tmux session({TMUX_PREFIX}*)만 다룹니다: {handle} ({name})")
+    return name
+
+
+def tmux_type(target: str, text: str, dry: bool):
+    run(["tmux", "send-keys", "-t", target, "-l", text], dry)
+    if not dry:
+        time.sleep(0.5)
+    run(["tmux", "send-keys", "-t", target, "Enter"], dry)
+
+
+def cmd_start(a):
+    ws = Path(a.workspace)
+    if not ws.is_absolute() or not ws.is_dir():
+        fail(f"workspace는 존재하는 절대경로여야 합니다: {a.workspace}")
+    request = check_request(a.request)
+    cli = shutil.which(a.worker)
+    if not cli:
+        fail(f"worker CLI를 찾을 수 없습니다: {a.worker}")
+    extra = WORKER_DEFAULT_ARGS[a.worker] + (a.worker_args[1:] if a.worker_args[:1] == ["--"] else a.worker_args)
+    line = request_line(request)
+
+    if a.env == "orca":
+        command = f"cd {shlex.quote(str(ws))} && {shlex.join([a.worker, *extra])}"
+        create = ["orca", "terminal", "create", "--title", a.title, "--command", command, "--json"]
+        if a.orca_worktree:
+            create[3:3] = ["--worktree", a.orca_worktree]
+        created = orca_json(create, a.dry_run)
+        handle = find_key(created, "handle") if created else "<handle>"
+        if not handle:
+            fail(f"orca 응답에서 terminal handle을 찾지 못했습니다: {json.dumps(created)[:500]}", 1)
+        # worker TUI가 입력을 받을 수 있을 때까지 기다린다. 완료 판정에는 쓰지 않는다.
+        orca_json(["orca", "terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+                   "--timeout-ms", str(a.ready_timeout * 1000), "--json"], a.dry_run)
+        sent = orca_json(["orca", "terminal", "send", "--terminal", handle, "--text", line,
+                          "--enter", "--wait-submit", "10", "--json"], a.dry_run)
+        result = {"env": "orca", "handle": handle, "sent": line, "send_result": sent}
+    else:
+        # 작업명·workspace가 같아도 겹치지 않게 무작위 접미사를 붙인다.
+        name = "-".join(p for p in [TMUX_PREFIX.rstrip("-"), slug(ws.name), slug(a.title),
+                                    secrets.token_hex(3)] if p)
+        pane = run(["tmux", "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name,
+                    "-c", str(ws), "-x", "220", "-y", "50"], a.dry_run)
+        pane = pane.strip() if pane else "<pane>"
+        # 새 session의 로그인 셸에서 worker를 시작하고, 요청 한 줄을 첫 prompt로 넘긴다.
+        tmux_type(pane, f"cd {shlex.quote(str(ws))} && {shlex.join([cli, *extra, line])}", a.dry_run)
+        result = {"env": "tmux", "handle": pane, "session": name, "sent": line,
+                  "attach": f"tmux attach -t {shlex.quote('=' + name)}"}
+    if not a.dry_run:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_send(a):
+    line = request_line(check_request(a.request))
+    if a.env == "orca":
+        sent = orca_json(["orca", "terminal", "send", "--terminal", a.handle, "--text", line,
+                          "--enter", "--wait-submit", "10", "--json"], a.dry_run)
+        result = {"env": "orca", "handle": a.handle, "sent": line, "send_result": sent}
+    else:
+        tmux_session_of(a.handle)
+        tmux_type(a.handle, line, a.dry_run)
+        result = {"env": "tmux", "handle": a.handle, "sent": line}
+    if not a.dry_run:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_read(a):
+    if a.env == "orca":
+        data = orca_json(["orca", "terminal", "read", "--terminal", a.handle, "--screen", "--json"], False)
+        term = (data or {}).get("result", {}).get("terminal", {})
+        print("\n".join(term.get("tail") or []))
+    else:
+        tmux_session_of(a.handle)
+        out = run(["tmux", "capture-pane", "-p", "-t", a.handle, "-S", f"-{a.lines}"], False)
+        print(out, end="")
+
+
+def cmd_close(a):
+    if a.env == "orca":
+        out = orca_json(["orca", "terminal", "close", "--terminal", a.handle, "--json"], a.dry_run)
+    else:
+        name = tmux_session_of(a.handle)
+        out = run(["tmux", "kill-session", "-t", f"={name}"], a.dry_run)
+    if not a.dry_run:
+        print(json.dumps({"env": a.env, "closed": a.handle}, ensure_ascii=False))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start", help="전용 worker terminal을 만들고 요청 한 줄을 보낸다")
+    s.add_argument("--env", choices=["orca", "tmux"], required=True)
+    s.add_argument("--worker", choices=["claude", "codex"], required=True)
+    s.add_argument("--workspace", required=True, help="worker를 시작할 폴더 절대경로")
+    s.add_argument("--request", required=True, help="요청서 절대경로")
+    s.add_argument("--title", required=True, help="작업명(Orca terminal 제목, tmux session 이름의 일부)")
+    s.add_argument("--orca-worktree", help="orca terminal create의 --worktree 선택자(생략 시 현재 workspace)")
+    s.add_argument("--ready-timeout", type=int, default=90, help="Orca worker 준비 대기 초")
+    s.add_argument("--dry-run", action="store_true", help="실행할 명령만 출력")
+    s.add_argument("worker_args", nargs=argparse.REMAINDER,
+                   help="-- 뒤에 사용자가 지정한 worker CLI 추가 인자(기본 권한 우회 flag 뒤에 붙음)")
+    s.set_defaults(fn=cmd_start)
+
+    s = sub.add_parser("send", help="같은 worker에 다음 요청 한 줄을 보낸다")
+    s.add_argument("--env", choices=["orca", "tmux"], required=True)
+    s.add_argument("--handle", required=True)
+    s.add_argument("--request", required=True)
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_send)
+
+    s = sub.add_parser("read", help="worker 화면을 읽는다(진단용, 완료 판정 아님)")
+    s.add_argument("--env", choices=["orca", "tmux"], required=True)
+    s.add_argument("--handle", required=True)
+    s.add_argument("--lines", type=int, default=80)
+    s.set_defaults(fn=cmd_read)
+
+    s = sub.add_parser("close", help="이 helper가 만든 worker terminal을 닫는다")
+    s.add_argument("--env", choices=["orca", "tmux"], required=True)
+    s.add_argument("--handle", required=True)
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_close)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

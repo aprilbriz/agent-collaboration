@@ -1,0 +1,71 @@
+#!/bin/sh
+# 대상 workspace에 협업 패키지를 연결한다(사용자가 직접 실행).
+#   collab-init "<workspace 절대경로>" [--comm-dir "<절대경로>"] [--dry-run]
+# - <comm dir>/RULES.md              -> 패키지 RULES.md (symlink)
+# - <workspace>/.agents/skills/...   -> plan-with-me, collaboration-with-claude (Codex host용)
+# - <workspace>/.claude/skills/...   -> plan-with-me, collaboration-with-codex (Claude host용)
+# - 만든 경로를 해당 git 저장소의 .git/info/exclude에 추가(추적 파일은 바꾸지 않음)
+# 연결할 자리에 다른 파일·폴더가 이미 있으면 아무것도 바꾸지 않고 목록을 알린 뒤 종료 코드 1로 끝낸다.
+set -eu
+
+PKG=$(cd "$(dirname "$0")/.." && pwd -P)
+WS=""; COMM=""; DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --comm-dir) COMM=$2; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) [ -z "$WS" ] || { echo "collab-init: 인자가 너무 많습니다: $1" >&2; exit 2; }; WS=$1; shift ;;
+  esac
+done
+[ -n "$WS" ] || { echo "사용법: collab-init \"<workspace>\" [--comm-dir \"<dir>\"] [--dry-run]" >&2; exit 2; }
+case "$WS" in /*) ;; *) echo "collab-init: workspace는 절대경로여야 합니다: $WS" >&2; exit 2 ;; esac
+[ -d "$WS" ] || { echo "collab-init: workspace가 없습니다: $WS" >&2; exit 2; }
+WS=$(cd "$WS" && pwd -P)
+[ -n "$COMM" ] || COMM="$WS/docs/.comm"
+case "$COMM" in /*) ;; *) echo "collab-init: comm dir은 절대경로여야 합니다: $COMM" >&2; exit 2 ;; esac
+
+# "원본|링크" 목록. 모두 함께 연결되어야 host skill이 가리키는 RULES.md·helper가 맞는다.
+LINKS="$PKG/RULES.md|$COMM/RULES.md
+$PKG/skills/plan-with-me|$WS/.agents/skills/plan-with-me
+$PKG/skills/collaboration-with-claude|$WS/.agents/skills/collaboration-with-claude
+$PKG/skills/plan-with-me|$WS/.claude/skills/plan-with-me
+$PKG/skills/collaboration-with-codex|$WS/.claude/skills/collaboration-with-codex"
+
+conflicts=$(printf '%s\n' "$LINKS" | while IFS='|' read -r src dst; do
+  if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then continue; fi
+  if [ -e "$dst" ] || [ -L "$dst" ]; then echo "  $dst"; fi
+done)
+if [ -n "$conflicts" ]; then
+  echo "collab-init: 다음 경로에 다른 파일·폴더가 있어 아무것도 바꾸지 않았습니다(적용 안 됨):" >&2
+  echo "$conflicts" >&2
+  echo "기존 파일을 직접 정리하거나 다른 --comm-dir/workspace를 지정한 뒤 다시 실행하세요." >&2
+  exit 1
+fi
+
+do_run() { if [ $DRY = 1 ]; then echo "+ $*"; else "$@"; fi; }
+
+exclude() {  # $1 = 만든 경로(절대)
+  dir=$(dirname "$1")
+  [ -d "$dir" ] || return 0
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 0
+  top=$(cd "$top" && pwd -P)
+  rel=${1#"$top"/}
+  git -C "$top" check-ignore -q --no-index "$rel" 2>/dev/null && return 0
+  ex=$(git -C "$top" rev-parse --git-path info/exclude)
+  case "$ex" in /*) ;; *) ex="$top/$ex" ;; esac
+  if [ $DRY = 1 ]; then echo "+ echo /$rel >> $ex"; else
+    mkdir -p "$(dirname "$ex")"; printf '/%s\n' "$rel" >> "$ex"; echo "exclude: /$rel ($ex)"; fi
+}
+
+do_run mkdir -p "$COMM"
+printf '%s\n' "$LINKS" | while IFS='|' read -r src dst; do
+  if [ -L "$dst" ]; then echo "유지: $dst"; else
+    do_run mkdir -p "$(dirname "$dst")"
+    do_run ln -s "$src" "$dst"
+    [ $DRY = 1 ] || echo "연결: $dst -> $src"
+  fi
+  case "$dst" in "$COMM"/*) ;; *) exclude "$dst" ;; esac
+done
+exclude "$COMM"
+echo "완료: workspace=$WS comm=$COMM"
