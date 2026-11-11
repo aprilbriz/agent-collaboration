@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""전용 worker terminal을 Orca 또는 tmux에서 만들고, 요청 한 줄을 보내고, 확인·종료한다.
+"""전용 worker를 시작하고 thread의 생성 기록과 실행 인스턴스를 대조해 통신한다.
 
-worker에게 보내는 입력은 항상 "<요청서 절대경로> — RULES.md 준수" 한 줄이다.
-이 helper는 자신이 만든 terminal(Orca handle, tmux `collab-` session의 pane)만 다룬다.
-tmux handle은 worker가 실행된 pane id(`%N`)라서 사용자가 창을 바꿔도 같은 worker를 가리킨다.
-전송 결과는 입력 접수일 뿐이며 작업 완료는 회신 파일로 판단한다.
+입력은 항상 "<요청서 절대경로> — RULES.md 준수" 한 줄이다.
+전송 접수·turn 시작 관찰은 완료 판정이 아니다. helper는 자동 재전송·종료하지 않는다.
 """
 import argparse
 import json
@@ -15,218 +13,577 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 TMUX_PREFIX = "collab-"
-# 전용 worker에만 기존처럼 권한 우회를 기본 적용한다. host·전역 설정과 model은 바꾸지 않는다.
+RECORD_NAME = "worker-record.json"
+HISTORY_DIR = "worker-record-history"
 WORKER_DEFAULT_ARGS = {
     "claude": ["--dangerously-skip-permissions"],
     "codex": ["--dangerously-bypass-approvals-and-sandbox"],
 }
 
 
-def fail(msg: str, code: int = 2):
-    print(f"collab-worker: {msg}", file=sys.stderr)
-    sys.exit(code)
+class WorkerError(Exception):
+    def __init__(self, message, code=2, data=None):
+        super().__init__(message)
+        self.code = code
+        self.data = data
 
 
-def request_line(request: str) -> str:
+def fail(message, code=2, data=None):
+    raise WorkerError(message, code, data)
+
+
+def request_line(request):
     return f"{request} — RULES.md 준수"
 
 
-def check_request(request: str) -> str:
+def check_thread(thread):
+    p = Path(thread)
+    if not p.is_absolute() or not p.is_dir() or not (p.parent / "RULES.md").is_file():
+        fail(f"thread는 comm RULES.md 아래 존재하는 절대경로여야 합니다: {thread}")
+    return p.resolve()
+
+
+def check_request(request):
     p = Path(request)
-    if not p.is_absolute():
-        fail(f"요청서는 절대경로여야 합니다: {request}")
-    if not p.is_file():
-        fail(f"요청서가 없습니다: {request}")
-    rules = p.parent.parent / "RULES.md"
-    if not rules.is_file():
-        fail(f"comm dir에 RULES.md가 없습니다: {rules} (bin/collab-init으로 연결)")
+    if not p.is_absolute() or not p.is_file():
+        fail(f"요청서는 존재하는 절대경로여야 합니다: {request}")
+    if "\n" in str(p) or "\r" in str(p):
+        fail("요청서 경로에는 줄바꿈을 쓸 수 없습니다")
+    p = p.resolve()
+    check_thread(p.parent)
     return str(p)
 
 
-def run(cmd, dry: bool, capture: bool = True):
+def run(cmd, dry=False):
     if dry:
         print("+ " + shlex.join(cmd))
         return None
-    res = subprocess.run(cmd, capture_output=capture, text=True)
-    if res.returncode != 0:
-        detail = (res.stderr or res.stdout or "").strip()
-        fail(f"명령 실패({res.returncode}): {shlex.join(cmd)}\n{detail}", 1)
-    return res.stdout
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode:
+        data = None
+        try:
+            data = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            pass
+        fail(f"명령 실패({result.returncode}): {shlex.join(cmd)}\n"
+             f"{(result.stderr or result.stdout).strip()}", 1, data)
+    return result.stdout
 
 
-def orca_json(cmd, dry: bool):
+def orca_json(cmd, dry=False):
     out = run(cmd, dry)
     if out is None:
         return None
     try:
         data = json.loads(out)
-    except json.JSONDecodeError:
+    except ValueError:
         fail(f"orca JSON 해석 실패: {out[:500]}", 1)
-    if isinstance(data, dict) and data.get("ok") is False:
-        fail(f"orca 오류: {json.dumps(data.get('error'), ensure_ascii=False)}", 1)
+    if not isinstance(data, dict):
+        fail("orca 응답이 JSON object가 아닙니다", 1, data)
+    if data.get("ok") is False:
+        fail(f"orca 오류: {json.dumps(data.get('error'), ensure_ascii=False)}", 1, data)
     return data
 
 
-def find_key(data, key):
+def walk(data):
+    yield data
     if isinstance(data, dict):
-        if isinstance(data.get(key), str):
-            return data[key]
-        for v in data.values():
-            found = find_key(v, key)
-            if found:
-                return found
+        for value in data.values():
+            yield from walk(value)
     elif isinstance(data, list):
-        for v in data:
-            found = find_key(v, key)
-            if found:
-                return found
-    return None
+        for value in data:
+            yield from walk(value)
 
 
-def slug(text: str) -> str:
-    return re.sub(r"-+", "-", re.sub(r"[^A-Za-z0-9_-]", "-", text)).strip("-")[:24]
+def find_key(data, key):
+    return next((part[key] for part in walk(data)
+                 if isinstance(part, dict) and isinstance(part.get(key), str)), None)
 
 
-def tmux_session_of(handle: str) -> str:
-    """pane handle이 이 helper가 만든 session에 있는지 확인하고 session 이름을 돌려준다."""
+def record_path(thread):
+    return Path(thread) / RECORD_NAME
+
+
+def save_record(record):
+    path = record_path(record["thread"])
+    if path.is_symlink():
+        fail(f"worker 기록은 symlink일 수 없습니다: {path}")
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=".worker-record-", delete=False) as stream:
+            temp = Path(stream.name)
+            json.dump(record, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
+def new_record(thread, env, handle, worker, workspace, request):
+    return {"version": 1, "thread": str(Path(thread).resolve()), "env": env,
+            "handle": handle, "worker": worker, "workspace": str(Path(workspace).resolve()),
+            "request": request, "identity": None, "stage": "created", "status": "open",
+            "transmission": {"attempted": False, "input_accepted": False, "turn_started": False}}
+
+
+def read_saved_record(thread, env=None, handle=None):
+    """소유권만 검사한다. 종료 확인 복구에는 live identity가 필요하지 않다."""
+    thread = Path(thread).resolve()
+    path = record_path(thread)
+    if path.is_symlink():
+        fail(f"worker 기록은 symlink일 수 없습니다: {path}")
+    try:
+        raw = path.read_bytes()
+        record = json.loads(raw)
+    except (OSError, ValueError) as error:
+        fail(f"worker 생성 기록을 읽을 수 없습니다: {path}: {error}")
+    if (not isinstance(record, dict) or record.get("version") != 1
+            or record.get("thread") != str(thread)
+            or record.get("env") not in {"orca", "tmux"}
+            or not isinstance(record.get("handle"), str) or not record["handle"]
+            or env is not None and record.get("env") != env
+            or handle is not None and record.get("handle") != handle):
+        fail("thread·환경·handle이 worker 생성 기록과 일치하지 않습니다")
+    return record, raw
+
+
+def recovery_hint(thread, env, handle):
+    command = shlex.join([str(Path(__file__).resolve()), "mark-closed", "--env", env,
+                          "--handle", handle, "--thread", str(thread), "--closed-by-user",
+                          "--reason", "<직접 종료를 확인한 사유>"])
+    return ("원래 worker의 종료를 직접 확인하세요. 남아 있으면 Orca/tmux에서 직접 닫은 뒤 "
+            "기록만 정리하세요(terminal을 자동 조작하지 않음): " + command)
+
+
+def load_record(thread, env, handle):
+    record, _ = read_saved_record(thread, env, handle)
+    if record.get("status") == "closed":
+        fail("이미 닫힌 worker 기록입니다")
+    if not isinstance(record.get("identity"), dict) or not record["identity"]:
+        fail("worker 실행 인스턴스 기록이 없어 안전하게 확인할 수 없습니다\n"
+             + recovery_hint(thread, env, handle))
+    return record
+
+
+def archive_record(thread, raw):
+    """원본 bytes를 exclusive 파일에 보존한다. history의 symlink를 따라가지 않는다."""
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    thread_fd = os.open(thread, directory_flags)
+    history_fd = None
+    try:
+        try:
+            os.mkdir(HISTORY_DIR, mode=0o700, dir_fd=thread_fd)
+        except FileExistsError:
+            pass
+        history_fd = os.open(HISTORY_DIR, directory_flags, dir_fd=thread_fd)
+        for _ in range(16):
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            name = f"{stamp}-{secrets.token_hex(6)}.json"
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=history_fd)
+            except FileExistsError:
+                continue
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return str(Path(thread) / HISTORY_DIR / name)
+        fail("worker 기록 이력 파일명이 충돌했습니다. 기존 이력은 보존했습니다", 1)
+    finally:
+        if history_fd is not None:
+            os.close(history_fd)
+        os.close(thread_fd)
+
+
+def orca_identity(data):
+    terminal = (data.get("result") or {}).get("terminal") or {}
+    identity = {key: terminal.get(key) for key in
+                ("ptyId", "incarnationId", "executionHostId", "worktreeId", "worktreePath")}
+    identity["runtimeId"] = (data.get("_meta") or {}).get("runtimeId")
+    if any(not isinstance(value, str) or not value for value in identity.values()):
+        fail("Orca의 실행 인스턴스 식별 정보가 부족합니다. 원본 metadata를 확인하세요", 1, data)
+    return identity
+
+
+def reject_self(env, handle, identity=None):
+    if env == "orca":
+        own_handle = os.environ.get("ORCA_TERMINAL_HANDLE")
+        if own_handle and handle == own_handle:
+            fail("호출자 자신의 Orca terminal은 worker로 조작하지 않습니다")
+        if identity:
+            for name in ("ORCA_PTY_ID", "ORCA_TERMINAL_PTY_ID"):
+                if os.environ.get(name) == identity.get("ptyId"):
+                    fail("호출자 자신의 Orca PTY는 worker로 조작하지 않습니다")
+    elif os.environ.get("TMUX_PANE") == handle and identity:
+        caller = os.environ.get("TMUX", "").rsplit(",", 2)
+        if len(caller) == 3 and caller[:2] == [identity.get("socketPath"), identity.get("serverPid")]:
+            fail("호출자 자신의 tmux pane은 worker로 조작하지 않습니다")
+
+
+def tmux_identity(handle):
     if not re.fullmatch(r"%\d+", handle):
-        fail(f"tmux handle은 start가 돌려준 pane id(%N)여야 합니다: {handle}")
-    res = subprocess.run(["tmux", "display-message", "-p", "-t", handle, "#{session_name}"],
-                         capture_output=True, text=True)
-    if res.returncode != 0:
-        fail(f"tmux pane이 없습니다: {handle}", 1)
-    name = res.stdout.strip()
-    if not name.startswith(TMUX_PREFIX):
-        fail(f"이 helper가 만든 tmux session({TMUX_PREFIX}*)만 다룹니다: {handle} ({name})")
-    return name
+        fail(f"tmux handle은 pane id(%N)여야 합니다: {handle}")
+    fmt = "#{session_id}\t#{session_name}\t#{session_created}\t#{pane_pid}\t#{pid}\t#{socket_path}"
+    parts = run(["tmux", "display-message", "-p", "-t", handle, fmt]).strip().split("\t")
+    if len(parts) != 6 or not parts[1].startswith(TMUX_PREFIX):
+        fail(f"전용 collab- tmux session의 pane이 아닙니다: {handle}")
+    identity = dict(zip(("sessionId", "session", "sessionCreated", "panePid", "serverPid", "socketPath"), parts))
+    identity["serverStarted"] = run(["ps", "-o", "lstart=", "-p", identity["serverPid"]]).strip()
+    if not identity["serverStarted"]:
+        fail("tmux server 실행 인스턴스를 확인할 수 없습니다", 1)
+    return identity
 
 
-def tmux_type(target: str, text: str, dry: bool):
+def verify_worker(thread, env, handle, dry=False):
+    record = load_record(thread, env, handle)
+    reject_self(env, handle, record["identity"])
+    try:
+        if env == "orca":
+            command = ["orca", "terminal", "show", "--terminal", handle, "--json"]
+            data = orca_json(command, dry)
+            if dry:
+                return record
+            if (data.get("result") or {}).get("terminal", {}).get("handle") != handle:
+                fail("Orca terminal handle이 조회 결과와 일치하지 않습니다")
+            current = orca_identity(data)
+        else:
+            if dry:
+                return record
+            current = tmux_identity(handle)
+        if current != record["identity"]:
+            fail("worker 실행 인스턴스가 바뀌었습니다. 기록과 다른 terminal/process는 조작하지 않습니다")
+    except WorkerError as error:
+        fail(str(error) + "\n" + recovery_hint(thread, env, handle), error.code, error.data)
+    except OSError as error:
+        fail(str(error) + "\n" + recovery_hint(thread, env, handle), 1)
+    return record
+
+
+def receipt_summary(data, handle, line, seconds=10):
+    dictionaries = [part for part in walk(data) if isinstance(part, dict)]
+    stages = {stage for part in dictionaries if isinstance(part.get("stages"), list)
+              for stage in part["stages"] if isinstance(stage, str)}
+    def observed(keys, names):
+        values = [part[key] for part in dictionaries for key in keys if isinstance(part.get(key), bool)]
+        if True in values or stages.intersection(names):
+            return True
+        if False in values or stages:
+            return False
+        return None
+    accepted = observed(("accepted", "inputAccepted", "input_accepted"), {"input_accepted"})
+    started = observed(("turnStarted", "turn_started", "turnStartObserved", "turn_start_observed"),
+                       {"turn_started", "turn_start_observed"})
+    retry = next((part[key] for part in dictionaries for key in ("retryRequestId", "requestId", "request_id")
+                  if isinstance(part.get(key), str) and part[key]), None)
+    warning_retry = None
+    warnings = [part[key] for part in dictionaries for key in ("warning", "warnings") if key in part]
+    for warning in walk(warnings):
+        if isinstance(warning, str):
+            match = re.search(r"--retry-request\s+([A-Za-z0-9_-]+)", warning)
+            if match:
+                warning_retry = match.group(1)
+                break
+    retry = retry or warning_retry
+    observation = find_key(data, "observation")
+    provider = find_key(data, "provider")
+    unsafe = observation in {"incarnation_replaced", "unsupported"} or provider in {"old-host", "unsupported"}
+    safe_retry = accepted is not False and not unsafe and (
+        observation == "supported" or warning_retry == retry and retry is not None)
+    command = None
+    if started is not True and retry and safe_retry:
+        command = shlex.join(["orca", "terminal", "send", "--terminal", handle, "--text", line,
+                              "--enter", "--retry-request", retry, "--wait-submit", str(seconds), "--json"])
+    return {"input_accepted": accepted, "turn_started": started, "confirmation_command": command,
+            "note": ("turn 시작 관찰은 완료가 아닙니다" if started else
+                     "turn 시작 미관찰/미확인. 자동 재전송하지 않았습니다. retry ID 확인 명령만 수동 실행하세요"
+                     if command else "turn 시작 미관찰/미확인. 안전한 retry 안내 또는 request ID가 없어 확인 명령을 만들지 않았습니다. 원본 receipt를 확인하고 재전송하지 마세요")}
+
+
+def send_orca(handle, line, dry=False):
+    return orca_json(["orca", "terminal", "send", "--terminal", handle, "--text", line,
+                      "--enter", "--wait-submit", "10", "--json"], dry)
+
+
+def tmux_type(target, text, dry=False):
     run(["tmux", "send-keys", "-t", target, "-l", text], dry)
     if not dry:
         time.sleep(0.5)
     run(["tmux", "send-keys", "-t", target, "Enter"], dry)
 
 
+def emit(data):
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def update_sent(record, sent, line):
+    summary = receipt_summary(sent, record["handle"], line) if record["env"] == "orca" else {
+        "input_accepted": None, "turn_started": None, "confirmation_command": None,
+        "note": "tmux 입력을 보냈습니다. turn 시작·완료는 관찰하지 않습니다"}
+    record.update(stage="sent", status="open", send_result=sent, send_summary=summary)
+    record["transmission"] = {"attempted": True, "input_accepted": summary["input_accepted"],
+                              "turn_started": summary["turn_started"]}
+    save_record(record)
+    return summary
+
+
+def mark_sending(record):
+    record["stage"] = "sending"
+    record["transmission"] = {"attempted": True, "input_accepted": None, "turn_started": None}
+    save_record(record)
+
+
 def cmd_start(a):
     ws = Path(a.workspace)
     if not ws.is_absolute() or not ws.is_dir():
         fail(f"workspace는 존재하는 절대경로여야 합니다: {a.workspace}")
+    ws = ws.resolve()
     request = check_request(a.request)
+    thread = Path(request).parent
+    previous_raw = None
+    if record_path(thread).exists() or record_path(thread).is_symlink():
+        previous, previous_raw = read_saved_record(thread)
+        if previous.get("status") != "closed":
+            close_command = shlex.join([str(Path(__file__).resolve()), "close", "--env", previous["env"],
+                                        "--handle", previous["handle"], "--thread", str(thread)])
+            fail("이 thread에 아직 닫히지 않은 worker 기록이 이미 있습니다. 먼저 close하세요: "
+                 + close_command)
     cli = shutil.which(a.worker)
     if not cli:
         fail(f"worker CLI를 찾을 수 없습니다: {a.worker}")
     extra = WORKER_DEFAULT_ARGS[a.worker] + (a.worker_args[1:] if a.worker_args[:1] == ["--"] else a.worker_args)
     line = request_line(request)
-
-    if a.env == "orca":
-        command = f"cd {shlex.quote(str(ws))} && {shlex.join([a.worker, *extra])}"
-        create = ["orca", "terminal", "create", "--title", a.title, "--command", command, "--json"]
-        if a.orca_worktree:
-            create[3:3] = ["--worktree", a.orca_worktree]
-        created = orca_json(create, a.dry_run)
-        handle = find_key(created, "handle") if created else "<handle>"
-        if not handle:
-            fail(f"orca 응답에서 terminal handle을 찾지 못했습니다: {json.dumps(created)[:500]}", 1)
-        # worker TUI가 입력을 받을 수 있을 때까지 기다린다. 완료 판정에는 쓰지 않는다.
-        orca_json(["orca", "terminal", "wait", "--terminal", handle, "--for", "tui-idle",
-                   "--timeout-ms", str(a.ready_timeout * 1000), "--json"], a.dry_run)
-        sent = orca_json(["orca", "terminal", "send", "--terminal", handle, "--text", line,
-                          "--enter", "--wait-submit", "10", "--json"], a.dry_run)
-        result = {"env": "orca", "handle": handle, "sent": line, "send_result": sent}
-    else:
-        # 작업명·workspace가 같아도 겹치지 않게 무작위 접미사를 붙인다.
-        name = "-".join(p for p in [TMUX_PREFIX.rstrip("-"), slug(ws.name), slug(a.title),
-                                    secrets.token_hex(3)] if p)
-        pane = run(["tmux", "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name,
-                    "-c", str(ws), "-x", "220", "-y", "50"], a.dry_run)
-        pane = pane.strip() if pane else "<pane>"
-        # 새 session의 로그인 셸에서 worker를 시작하고, 요청 한 줄을 첫 prompt로 넘긴다.
-        tmux_type(pane, f"cd {shlex.quote(str(ws))} && {shlex.join([cli, *extra, line])}", a.dry_run)
-        result = {"env": "tmux", "handle": pane, "session": name, "sent": line,
-                  "attach": f"tmux attach -t {shlex.quote('=' + name)}"}
-    if not a.dry_run:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+    record = None
+    stage = "creating"
+    handle = None
+    archived_record = None
+    try:
+        if previous_raw is not None and not a.dry_run:
+            stage = "archiving"
+            archived_record = archive_record(thread, previous_raw)
+        stage = "creating"
+        if a.env == "orca":
+            command = f"cd {shlex.quote(str(ws))} && {shlex.join([a.worker, *extra])}"
+            create = ["orca", "terminal", "create", "--title", a.title, "--command", command, "--json"]
+            if a.orca_worktree:
+                create[3:3] = ["--worktree", a.orca_worktree]
+            created = orca_json(create, a.dry_run)
+            handle = find_key(created, "handle") if not a.dry_run else "<handle>"
+            if not handle:
+                fail("orca 응답에서 terminal handle을 찾지 못했습니다", 1, created)
+            stage = "created"
+            if not a.dry_run:
+                reject_self(a.env, handle)
+                record = new_record(thread, a.env, handle, a.worker, ws, request)
+                save_record(record)
+            stage = "identifying"
+            metadata = orca_json(["orca", "terminal", "show", "--terminal", handle, "--json"], a.dry_run)
+            if record:
+                if (metadata.get("result") or {}).get("terminal", {}).get("handle") != handle:
+                    fail("생성한 terminal과 조회된 handle이 다릅니다", 1, metadata)
+                record["identity"] = orca_identity(metadata)
+                reject_self(a.env, handle, record["identity"])
+                record["stage"] = "waiting"
+                save_record(record)
+            stage = "waiting"
+            orca_json(["orca", "terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+                       "--timeout-ms", str(a.ready_timeout * 1000), "--json"], a.dry_run)
+            stage = "sending"
+            if record:
+                # wait 동안 terminal이 교체됐을 가능성도 전송 직전에 확인한다.
+                verify_worker(thread, a.env, handle)
+                mark_sending(record)
+            sent = send_orca(handle, line, a.dry_run)
+            result = {"env": a.env, "handle": handle, "sent": line, "send_result": sent}
+        else:
+            slug = lambda text: re.sub(r"[^A-Za-z0-9_-]+", "-", text).strip("-")[:24]
+            name = "-".join(part for part in ["collab", slug(ws.name), slug(a.title), secrets.token_hex(3)] if part)
+            pane = run(["tmux", "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name,
+                        "-c", str(ws), "-x", "220", "-y", "50"], a.dry_run)
+            handle = pane.strip() if pane else "<pane>"
+            stage = "created"
+            if not a.dry_run:
+                reject_self(a.env, handle)
+                record = new_record(thread, a.env, handle, a.worker, ws, request)
+                save_record(record)
+                stage = "identifying"
+                record["identity"] = tmux_identity(handle)
+                reject_self(a.env, handle, record["identity"])
+                save_record(record)
+                mark_sending(record)
+            stage = "sending"
+            # exec가 끝나면 pane도 끝나므로 worker 종료 후 남은 shell에 후속 입력을 보내지 않는다.
+            tmux_type(handle, f"cd {shlex.quote(str(ws))} && exec {shlex.join([cli, *extra, line])}", a.dry_run)
+            sent = None
+            result = {"env": a.env, "handle": handle, "session": name, "sent": line,
+                      "attach": f"tmux attach -t {shlex.quote('=' + name)}"}
+        if record:
+            result["send_summary"] = update_sent(record, sent, line)
+            result["record"] = str(record_path(thread))
+            if archived_record:
+                result["archived_record"] = archived_record
+            emit(result)
+    except (WorkerError, OSError) as error:
+        if handle is None and isinstance(error, WorkerError):
+            handle = find_key(error.data, "handle")
+        if record is None and handle and not a.dry_run:
+            record = new_record(thread, a.env, handle, a.worker, ws, request)
+        failure = {"ok": False, "env": a.env, "stage": stage, "handle": handle,
+                   "transmission": record["transmission"] if record else {
+                       "attempted": False, "input_accepted": False, "turn_started": False},
+                   "error": str(error), "automatic_cleanup": False, "automatic_resend": False}
+        if archived_record:
+            failure["archived_record"] = archived_record
+        if isinstance(error, WorkerError) and error.data is not None:
+            failure["error_result"] = error.data
+        if record:
+            if not record.get("identity"):
+                failure["recovery"] = recovery_hint(thread, a.env, handle)
+                record["recovery"] = failure["recovery"]
+            record.update(stage=stage, status="failed", error=str(error))
+            if isinstance(error, WorkerError) and error.data is not None:
+                record["error_result"] = error.data
+            try:
+                save_record(record)
+                failure["record"] = str(record_path(thread))
+            except (OSError, WorkerError) as save_error:
+                failure["record_error"] = str(save_error)
+                try:
+                    persisted, _ = read_saved_record(thread, a.env, handle)
+                    usable_record = persisted.get("status") != "closed"
+                except WorkerError:
+                    usable_record = False
+                if not usable_record:
+                    failure["recovery"] = (
+                        "이 worker의 기록을 저장하지 못했습니다. 원래 worker를 Orca/tmux에서 직접 "
+                        "확인하고 닫은 뒤 기록 경로의 쓰기 오류를 해결하고 start를 다시 실행하세요")
+        emit(failure)
+        raise
 
 
 def cmd_send(a):
-    line = request_line(check_request(a.request))
-    if a.env == "orca":
-        sent = orca_json(["orca", "terminal", "send", "--terminal", a.handle, "--text", line,
-                          "--enter", "--wait-submit", "10", "--json"], a.dry_run)
-        result = {"env": "orca", "handle": a.handle, "sent": line, "send_result": sent}
-    else:
-        tmux_session_of(a.handle)
-        tmux_type(a.handle, line, a.dry_run)
-        result = {"env": "tmux", "handle": a.handle, "sent": line}
+    request = check_request(a.request)
+    thread = Path(request).parent
+    if a.thread and check_thread(a.thread) != thread:
+        fail("--thread와 요청서 thread가 다릅니다")
+    record = verify_worker(thread, a.env, a.handle, a.dry_run)
+    line = request_line(request)
     if not a.dry_run:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        record["request"] = request
+        mark_sending(record)
+    try:
+        if a.env == "orca":
+            sent = send_orca(a.handle, line, a.dry_run)
+        else:
+            tmux_type(a.handle, line, a.dry_run)
+            sent = None
+        if not a.dry_run:
+            summary = update_sent(record, sent, line)
+            emit({"env": a.env, "handle": a.handle, "sent": line,
+                  "send_result": sent, "send_summary": summary})
+    except (WorkerError, OSError) as error:
+        if not a.dry_run:
+            record.update(status="failed", error=str(error))
+            save_record(record)
+            emit({"ok": False, "stage": "sending", "handle": a.handle,
+                  "transmission": record["transmission"], "error": str(error),
+                  "automatic_resend": False})
+        raise
 
 
 def cmd_read(a):
+    thread = check_thread(a.thread)
+    verify_worker(thread, a.env, a.handle)
     if a.env == "orca":
-        data = orca_json(["orca", "terminal", "read", "--terminal", a.handle, "--screen", "--json"], False)
-        term = (data or {}).get("result", {}).get("terminal", {})
-        print("\n".join(term.get("tail") or []))
+        data = orca_json(["orca", "terminal", "read", "--terminal", a.handle, "--screen", "--json"])
+        terminal = (data or {}).get("result", {}).get("terminal", {})
+        print("\n".join((terminal.get("tail") or [])[-a.lines:]))
     else:
-        tmux_session_of(a.handle)
-        out = run(["tmux", "capture-pane", "-p", "-t", a.handle, "-S", f"-{a.lines}"], False)
-        print(out, end="")
+        print(run(["tmux", "capture-pane", "-p", "-t", a.handle, "-S", f"-{a.lines}"]), end="")
 
 
 def cmd_close(a):
+    thread = check_thread(a.thread)
+    record = verify_worker(thread, a.env, a.handle, a.dry_run)
     if a.env == "orca":
-        out = orca_json(["orca", "terminal", "close", "--terminal", a.handle, "--json"], a.dry_run)
+        orca_json(["orca", "terminal", "close", "--terminal", a.handle, "--json"], a.dry_run)
     else:
-        name = tmux_session_of(a.handle)
-        out = run(["tmux", "kill-session", "-t", f"={name}"], a.dry_run)
+        run(["tmux", "kill-pane", "-t", a.handle], a.dry_run)
     if not a.dry_run:
-        print(json.dumps({"env": a.env, "closed": a.handle}, ensure_ascii=False))
+        record.update(status="closed", stage="closed")
+        save_record(record)
+        emit({"env": a.env, "closed": a.handle})
+
+
+def cmd_mark_closed(a):
+    """사용자의 수동 종료 확인만 기록한다. terminal 조회·조작은 하지 않는다."""
+    if not a.closed_by_user or not a.reason or not a.reason.strip():
+        fail("수동 종료 확인 --closed-by-user와 비어 있지 않은 --reason이 필요합니다")
+    thread = check_thread(a.thread)
+    record, _ = read_saved_record(thread, a.env, a.handle)
+    if record.get("status") == "closed":
+        fail("이미 닫힌 worker 기록입니다. 기존 종료 사유를 보존합니다")
+    reason = a.reason.strip()
+    record.update(status="closed", stage="closed", closure={"method": "user-confirmed", "reason": reason,
+                  "confirmed_at": datetime.now(timezone.utc).isoformat()})
+    save_record(record)
+    emit({"env": a.env, "marked_closed": a.handle, "record": str(record_path(thread)),
+          "terminal_modified": False, "reason": reason})
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    s = sub.add_parser("start", help="전용 worker terminal을 만들고 요청 한 줄을 보낸다")
-    s.add_argument("--env", choices=["orca", "tmux"], required=True)
-    s.add_argument("--worker", choices=["claude", "codex"], required=True)
-    s.add_argument("--workspace", required=True, help="worker를 시작할 폴더 절대경로")
-    s.add_argument("--request", required=True, help="요청서 절대경로")
-    s.add_argument("--title", required=True, help="작업명(Orca terminal 제목, tmux session 이름의 일부)")
-    s.add_argument("--orca-worktree", help="orca terminal create의 --worktree 선택자(생략 시 현재 workspace)")
-    s.add_argument("--ready-timeout", type=int, default=90, help="Orca worker 준비 대기 초")
-    s.add_argument("--dry-run", action="store_true", help="실행할 명령만 출력")
-    s.add_argument("worker_args", nargs=argparse.REMAINDER,
-                   help="-- 뒤에 사용자가 지정한 worker CLI 추가 인자(기본 권한 우회 flag 뒤에 붙음)")
-    s.set_defaults(fn=cmd_start)
-
-    s = sub.add_parser("send", help="같은 worker에 다음 요청 한 줄을 보낸다")
-    s.add_argument("--env", choices=["orca", "tmux"], required=True)
-    s.add_argument("--handle", required=True)
-    s.add_argument("--request", required=True)
-    s.add_argument("--dry-run", action="store_true")
-    s.set_defaults(fn=cmd_send)
-
-    s = sub.add_parser("read", help="worker 화면을 읽는다(진단용, 완료 판정 아님)")
-    s.add_argument("--env", choices=["orca", "tmux"], required=True)
-    s.add_argument("--handle", required=True)
-    s.add_argument("--lines", type=int, default=80)
-    s.set_defaults(fn=cmd_read)
-
-    s = sub.add_parser("close", help="이 helper가 만든 worker terminal을 닫는다")
-    s.add_argument("--env", choices=["orca", "tmux"], required=True)
-    s.add_argument("--handle", required=True)
-    s.add_argument("--dry-run", action="store_true")
-    s.set_defaults(fn=cmd_close)
-
-    a = ap.parse_args()
-    a.fn(a)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("start", help="전용 worker를 만들고 thread에 생성 기록을 남긴다")
+    p.add_argument("--env", choices=["orca", "tmux"], required=True)
+    p.add_argument("--worker", choices=["claude", "codex"], required=True)
+    p.add_argument("--workspace", required=True)
+    p.add_argument("--request", required=True)
+    p.add_argument("--title", required=True)
+    p.add_argument("--orca-worktree")
+    p.add_argument("--ready-timeout", type=int, default=90)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("worker_args", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_start)
+    for name, function in (("send", cmd_send), ("read", cmd_read), ("close", cmd_close)):
+        p = sub.add_parser(name)
+        p.add_argument("--env", choices=["orca", "tmux"], required=True)
+        p.add_argument("--handle", required=True)
+        p.add_argument("--thread", required=name != "send", help="worker 생성 기록이 있는 thread 절대경로")
+        if name == "send":
+            p.add_argument("--request", required=True)
+        if name == "read":
+            p.add_argument("--lines", type=int, default=80)
+        else:
+            p.add_argument("--dry-run", action="store_true")
+        p.set_defaults(fn=function)
+    p = sub.add_parser("mark-closed", help="사용자가 직접 닫은 worker의 기록만 closed로 표시한다")
+    p.add_argument("--env", choices=["orca", "tmux"], required=True)
+    p.add_argument("--handle", required=True)
+    p.add_argument("--thread", required=True)
+    p.add_argument("--closed-by-user", action="store_true", required=True,
+                   help="사용자가 원래 worker의 종료를 직접 확인했음")
+    p.add_argument("--reason", required=True, help="수동 종료를 확인한 사유(필수)")
+    p.set_defaults(fn=cmd_mark_closed)
+    args = parser.parse_args()
+    try:
+        args.fn(args)
+    except WorkerError as error:
+        print(f"collab-worker: {error}", file=sys.stderr)
+        return error.code
+    except OSError as error:
+        print(f"collab-worker: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -9,21 +9,31 @@
 set -eu
 
 PKG=$(cd "$(dirname "$0")/.." && pwd -P)
-WS=""; COMM=""; DRY=0
+usage_error() {
+  echo "collab-init: $1" >&2
+  echo '사용법: collab-init "<workspace>" [--comm-dir "<dir>"] [--dry-run]' >&2
+  exit 2
+}
+WS=""; WS_SET=0; COMM=""; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --comm-dir) COMM=$2; shift 2 ;;
+    --comm-dir)
+      [ $# -ge 2 ] || usage_error '--comm-dir 값이 없습니다'
+      [ -n "$2" ] || usage_error '--comm-dir 값이 비어 있습니다'
+      case "$2" in -*) usage_error "--comm-dir 다음에 옵션이 왔습니다: $2" ;; esac
+      COMM=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) [ -z "$WS" ] || { echo "collab-init: 인자가 너무 많습니다: $1" >&2; exit 2; }; WS=$1; shift ;;
+    -*) usage_error "알 수 없는 옵션입니다: $1" ;;
+    *) [ $WS_SET = 0 ] || usage_error "인자가 너무 많습니다: $1"; WS=$1; WS_SET=1; shift ;;
   esac
 done
-[ -n "$WS" ] || { echo "사용법: collab-init \"<workspace>\" [--comm-dir \"<dir>\"] [--dry-run]" >&2; exit 2; }
-case "$WS" in /*) ;; *) echo "collab-init: workspace는 절대경로여야 합니다: $WS" >&2; exit 2 ;; esac
-[ -d "$WS" ] || { echo "collab-init: workspace가 없습니다: $WS" >&2; exit 2; }
+[ -n "$WS" ] || usage_error 'workspace가 없습니다'
+case "$WS" in /*) ;; *) usage_error "workspace는 절대경로여야 합니다: $WS" ;; esac
+[ -d "$WS" ] || usage_error "workspace가 없습니다: $WS"
 WS=$(cd "$WS" && pwd -P)
-[ -n "$COMM" ] || COMM="$WS/docs/.comm"
-case "$COMM" in /*) ;; *) echo "collab-init: comm dir은 절대경로여야 합니다: $COMM" >&2; exit 2 ;; esac
+[ -n "$COMM" ] || COMM="$WS/.comm"
+case "$COMM" in /*) ;; *) usage_error "comm dir은 절대경로여야 합니다: $COMM" ;; esac
 
 # "원본|링크" 목록. 모두 함께 연결되어야 host skill이 가리키는 RULES.md·helper가 맞는다.
 LINKS="$PKG/RULES.md|$COMM/RULES.md
@@ -33,6 +43,15 @@ $PKG/skills/plan-with-me|$WS/.claude/skills/plan-with-me
 $PKG/skills/collaboration-with-codex|$WS/.claude/skills/collaboration-with-codex"
 
 conflicts=$(printf '%s\n' "$LINKS" | while IFS='|' read -r src dst; do
+  # ENOTDIR도 최종 경로의 -e 검사에서는 '없음'처럼 보이므로 부모부터 확인한다.
+  parent=$(dirname "$dst")
+  while :; do
+    if { [ -e "$parent" ] || [ -L "$parent" ]; } && [ ! -d "$parent" ]; then
+      echo "  $parent (부모 경로가 디렉터리가 아님)"
+    fi
+    [ "$parent" = / ] && break
+    parent=$(dirname "$parent")
+  done
   if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then continue; fi
   if [ -e "$dst" ] || [ -L "$dst" ]; then echo "  $dst"; fi
 done)

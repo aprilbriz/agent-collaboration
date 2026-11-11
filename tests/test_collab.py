@@ -48,7 +48,7 @@ class TmpDir(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def make_thread(self, ws: Path, rules=True) -> Path:
-        comm = ws / "docs" / ".comm"
+        comm = ws / ".comm"
         thread = comm / "20261110-test"
         thread.mkdir(parents=True)
         if rules:
@@ -81,7 +81,7 @@ class NotifyClaudeTest(TmpDir):
     def test_sends_single_user_frame_line(self):
         sock = self.tmp / "s.sock"
         t, got = self.serve_once(sock)
-        msg = "Codex 회신 완료: /ws/docs/.comm/t/02-codex-implementation.md"
+        msg = "Codex 회신 완료: /ws/.comm/t/02-codex-implementation.md"
         res = sh(BIN / "notify-claude", "--socket", sock, "--message", msg)
         t.join(5)
         self.assertIn("sent:", res.stdout)
@@ -161,41 +161,46 @@ class CollabWorkerTmuxTest(TmpDir):
 
         # 사용자가 같은 session에 다른 창을 열어 활성화해도 원래 worker pane으로 간다.
         self.tmux("new-window", "-t", f"={session}:", "-n", "other", "cat > /dev/null")
-        self.assertNotEqual(self.tmux("display-message", "-p", "-t", f"={session}:", "#{pane_id}").stdout.strip(),
-                            handle)
+        other_handle = self.tmux("display-message", "-p", "-t", f"={session}:", "#{pane_id}").stdout.strip()
+        self.assertNotEqual(other_handle, handle)
         req2 = req.parent / "03-codex-request.md"
         req2.write_text("Status: OPEN\n")
         self.cw("send", "--env", "tmux", "--handle", handle, "--request", req2)
         input_file = ws / ".stub-input"
         self.assertTrue(wait_for(lambda: input_file.exists() and "03-codex" in input_file.read_text()))
         self.assertEqual(input_file.read_text().splitlines()[-1], f"{req2} — RULES.md 준수")
-        self.assertIn("03-codex-request.md", self.cw("read", "--env", "tmux", "--handle", handle).stdout)
+        self.assertIn("03-codex-request.md", self.cw("read", "--env", "tmux", "--handle", handle,
+                                                  "--thread", req.parent).stdout)
 
-        self.cw("close", "--env", "tmux", "--handle", handle)
-        self.assertNotEqual(self.tmux("has-session", "-t", f"={session}", check=False).returncode, 0)
+        self.cw("close", "--env", "tmux", "--handle", handle, "--thread", req.parent)
+        self.assertEqual(self.tmux("has-session", "-t", f"={session}", check=False).returncode, 0)
+        panes = self.tmux("list-panes", "-a", "-F", "#{pane_id}").stdout.splitlines()
+        self.assertNotIn(handle, panes)
+        self.assertIn(other_handle, panes)
 
     def test_same_title_in_two_workspaces_gets_separate_workers(self):
         infos = []
         for name in ["project one", "project two"]:
             ws = self.tmp / name
             ws.mkdir()
-            info, _ = self.start(ws, "구현")
-            infos.append(info)
+            info, req = self.start(ws, "구현")
+            infos.append((info, req.parent))
             self.assertEqual((ws / ".stub-cwd").read_text().strip(), str(ws))
-        self.assertNotEqual(infos[0]["handle"], infos[1]["handle"])
-        self.assertNotEqual(infos[0]["session"], infos[1]["session"])
-        for info in infos:
+        self.assertNotEqual(infos[0][0]["handle"], infos[1][0]["handle"])
+        self.assertNotEqual(infos[0][0]["session"], infos[1][0]["session"])
+        for info, thread in infos:
             self.assertTrue(info["session"].startswith("collab-project-"), info["session"])
-            self.cw("close", "--env", "tmux", "--handle", info["handle"])
+            self.cw("close", "--env", "tmux", "--handle", info["handle"], "--thread", thread)
 
     def test_refuses_foreign_pane(self):
-        pane = self.tmux("new-session", "-d", "-P", "-F", "#{pane_id}", "-s", "user-work").stdout.strip()
+        req = self.make_thread(self.tmp / "workspace")
+        pane = self.tmux("new-session", "-d", "-P", "-F", "#{pane_id}", "-s", "collab-foreign-fixture").stdout.strip()
         for cmd in (["close"], ["read"]):
-            res = self.cw(*cmd, "--env", "tmux", "--handle", pane, check=False)
+            res = self.cw(*cmd, "--env", "tmux", "--handle", pane, "--thread", req.parent, check=False)
             self.assertEqual(res.returncode, 2)
-        res = self.cw("close", "--env", "tmux", "--handle", "user-work", check=False)
+        res = self.cw("close", "--env", "tmux", "--handle", "collab-foreign-fixture", "--thread", req.parent, check=False)
         self.assertEqual(res.returncode, 2)
-        self.assertEqual(self.tmux("has-session", "-t", "=user-work", check=False).returncode, 0)
+        self.assertEqual(self.tmux("has-session", "-t", "=collab-foreign-fixture", check=False).returncode, 0)
 
     def test_preflight_errors(self):
         ws = self.tmp / "ws"
@@ -218,10 +223,11 @@ class CollabWorkerOrcaDryRunTest(TmpDir):
         res = sh(BIN / "collab-worker", "start", "--env", "orca", "--worker", "codex",
                  "--workspace", ws, "--request", req, "--title", "job", "--dry-run")
         cmds = [shlex.split(l[2:]) for l in res.stdout.splitlines()]
-        self.assertEqual(len(cmds), 3)
-        create, wait, send = cmds
+        self.assertEqual(len(cmds), 4)
+        create, show, wait, send = cmds
         self.assertEqual(create[:5], ["orca", "terminal", "create", "--title", "job"])
         self.assertEqual(create[create.index("--command") + 1], f"cd {shlex.quote(str(ws))} && codex --dangerously-bypass-approvals-and-sandbox")
+        self.assertEqual(show[:5], ["orca", "terminal", "show", "--terminal", "<handle>"])
         self.assertEqual(wait[wait.index("--for") + 1], "tui-idle")
         self.assertEqual(send[:5], ["orca", "terminal", "send", "--terminal", "<handle>"])
         self.assertEqual(send[send.index("--text") + 1], f"{req} — RULES.md 준수")
@@ -235,7 +241,7 @@ class CollabInitTest(TmpDir):
         ws.mkdir()
         sh("git", "init", "-q", ws)
         sh(BIN / "collab-init", ws)
-        self.assertEqual((ws / "docs/.comm/RULES.md").resolve(), ROOT / "RULES.md")
+        self.assertEqual((ws / ".comm/RULES.md").resolve(), ROOT / "RULES.md")
         for p in [".agents/skills/plan-with-me", ".agents/skills/collaboration-with-claude",
                   ".claude/skills/plan-with-me", ".claude/skills/collaboration-with-codex"]:
             self.assertTrue((ws / p / "SKILL.md").is_file(), p)
@@ -246,19 +252,19 @@ class CollabInitTest(TmpDir):
         exclude = (ws / ".git/info/exclude").read_text().splitlines()
         added = [l for l in exclude if l.startswith("/")]
         self.assertEqual(sorted(added), sorted(set(added)), "중복 exclude")
-        self.assertIn("/docs/.comm", added)
+        self.assertIn("/.comm", added)
         self.assertEqual(sh("git", "-C", ws, "status", "--porcelain").stdout.strip(), "",
                          "연결한 경로가 git status에 보이면 안 됨")
 
     def test_existing_rules_or_skill_blocks_whole_install(self):
         ws = self.tmp / "proj"
-        (ws / "docs/.comm").mkdir(parents=True)
-        (ws / "docs/.comm/RULES.md").write_text("기존 규칙\n")
+        (ws / ".comm").mkdir(parents=True)
+        (ws / ".comm/RULES.md").write_text("기존 규칙\n")
         res = sh(BIN / "collab-init", ws, check=False)
         self.assertEqual(res.returncode, 1)
         self.assertIn("RULES.md", res.stderr)
         self.assertNotIn("완료", res.stdout)
-        self.assertEqual((ws / "docs/.comm/RULES.md").read_text(), "기존 규칙\n")
+        self.assertEqual((ws / ".comm/RULES.md").read_text(), "기존 규칙\n")
         self.assertFalse((ws / ".agents").exists(), "충돌 시 host skill을 설치하면 안 됨")
         self.assertFalse((ws / ".claude").exists())
 
@@ -266,7 +272,7 @@ class CollabInitTest(TmpDir):
         (ws2 / ".claude/skills/plan-with-me").mkdir(parents=True)  # 사용자가 이미 가진 skill
         res = sh(BIN / "collab-init", ws2, check=False)
         self.assertEqual(res.returncode, 1)
-        self.assertFalse((ws2 / "docs").exists())
+        self.assertFalse((ws2 / ".comm").exists())
         self.assertFalse((ws2 / ".claude/skills/plan-with-me").is_symlink())
 
     def test_workspace_then_separate_target_comm_dir(self):
@@ -277,11 +283,11 @@ class CollabInitTest(TmpDir):
         target.mkdir()
         sh("git", "init", "-q", target)
         sh(BIN / "collab-init", ws)
-        comm = target / "docs/.comm"
+        comm = target / ".comm"
         again = sh(BIN / "collab-init", ws, "--comm-dir", comm)
         self.assertIn("유지", again.stdout)
         self.assertEqual((comm / "RULES.md").resolve(), ROOT / "RULES.md")
-        self.assertIn("/docs/.comm", (target / ".git/info/exclude").read_text())
+        self.assertIn("/.comm", (target / ".git/info/exclude").read_text())
         thread = comm / "20261110-x"
         thread.mkdir()
         req = thread / "01-codex-request.md"
@@ -318,7 +324,7 @@ class SpacePathDocumentedCommandsTest(TmpDir):
         sh("git", "init", "-q", ws)
         env = dict(os.environ, PKG=str(pkg), WS=str(ws))
         sh("sh", "-c", '"$PKG/bin/collab-init" "$WS"', env=env)
-        rules = ws / "docs/.comm/RULES.md"
+        rules = ws / ".comm/RULES.md"
         self.assertEqual(rules.resolve(), (pkg / "RULES.md").resolve())
         # host skill이 쓰는 <pkg> = realpath(RULES.md)의 부모에 helper가 있어야 한다.
         for helper in ["collab-worker", "notify-claude", "collab-init", "claude-host"]:
@@ -327,13 +333,13 @@ class SpacePathDocumentedCommandsTest(TmpDir):
         sock = self.tmp / "sock dir" / "s.sock"
         sock.parent.mkdir()
         t, got = NotifyClaudeTest.serve_once(self, sock)
-        reply = ws / "docs/.comm/t/02-codex-implementation.md"
+        reply = ws / ".comm/t/02-codex-implementation.md"
         env.update(SOCK=str(sock), REPLY=str(reply))
         sh("sh", "-c", '"$PKG/bin/notify-claude" --socket "$SOCK" --message "Codex 회신 완료: $REPLY"', env=env)
         t.join(5)
         self.assertEqual(json.loads(got["data"])["message"]["content"], f"Codex 회신 완료: {reply}")
 
-        thread = ws / "docs/.comm/20261110-t"
+        thread = ws / ".comm/20261110-t"
         thread.mkdir()
         req = thread / "01-claude-request.md"
         req.write_text("Status: OPEN\n")

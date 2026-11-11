@@ -12,7 +12,7 @@
   `--followup`이면 같은 worker에 `collab-worker send`로 03 요청을 보내 04 회신·`ok2`·host 수신까지 같은 기준으로 본다.
   결과 내용이 다르면 1, 회신은 있으나 host 수신이 보이지 않으면 두 화면을 출력하고 3으로 끝낸다.
   알림을 다른 프로세스에서 대신 보내지 않는다.
-- 끝나면 자신이 만든 terminal/session만 닫고 임시 workspace를 지운다(--keep이면 보존).
+- 끝나면 자신이 만든 terminal/pane만 닫는다. 성공 때만 임시 workspace를 지우며 실패·--keep이면 진단과 함께 보존한다.
   codex exec가 만든 host thread id는 출력만 하고 지우지 않는다.
 """
 import argparse
@@ -23,54 +23,118 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "bin"
+RUN_LOG = None
 
 
 def log(msg):
-    print(f"[e2e {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[e2e {time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    if RUN_LOG is not None:
+        with RUN_LOG.open("a") as stream:
+            stream.write(line + "\n")
 
 
 def run(cmd, **kw):
     res = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, **kw)
+    if RUN_LOG is not None:
+        with RUN_LOG.open("a") as stream:
+            stream.write(f"$ {shlex.join(map(str, cmd))}\n{res.stdout}\n{res.stderr}\nexit: {res.returncode}\n")
     if res.returncode != 0:
         raise RuntimeError(f"{shlex.join(map(str, cmd))} -> {res.returncode}\n{res.stdout}\n{res.stderr}")
     return res.stdout
 
 
-class Term:
-    """이 스크립트가 만든 terminal 하나(Orca handle 또는 tmux session)."""
+def orca_terminal(args):
+    data = json.loads(run(["orca", "terminal", *args, "--json"]))
+    if isinstance(data, dict) and data.get("ok") is False:
+        raise RuntimeError(f"orca 오류: {data.get('error')}")
+    return data
 
-    def __init__(self, env, title, ws, command):
+
+class Term:
+    """스크립트가 직접 만든 host와 기록이 있는 helper worker를 구분한다."""
+
+    def __init__(self, env, title, ws, command, registry=None):
         self.env = env
+        self.thread = None
         if env == "orca":
-            out = json.loads(run(["orca", "terminal", "create", "--title", title,
-                                  "--command", f"cd {shlex.quote(str(ws))} && {command}", "--json"]))
+            out = orca_terminal(["create", "--title", title,
+                                 "--command", f"cd {shlex.quote(str(ws))} && {command}"])
             self.handle = find_handle(out)
             if not self.handle:
                 raise RuntimeError(f"orca handle 없음: {out}")
+            if registry is not None:
+                registry.append(self)
         else:
-            # collab-worker read/close가 다룰 수 있게 collab- session의 pane id를 handle로 쓴다.
             self.handle = run(["tmux", "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", "collab-" + title,
                                "-c", ws, "-x", "220", "-y", "50"]).strip()
+            if registry is not None:
+                registry.append(self)
             run(["tmux", "send-keys", "-t", self.handle, "-l", f"cd {shlex.quote(str(ws))} && {command}"])
             time.sleep(0.5)
             run(["tmux", "send-keys", "-t", self.handle, "Enter"])
 
+    @classmethod
+    def worker(cls, env, handle, thread):
+        term = cls.__new__(cls)
+        term.env, term.handle, term.thread = env, handle, thread
+        return term
+
     def screen(self):
         try:
-            return run([BIN / "collab-worker", "read", "--env", self.env, "--handle", self.handle, "--lines", "200"])
-        except RuntimeError as e:
+            if self.thread is not None:
+                return run([BIN / "collab-worker", "read", "--env", self.env, "--handle", self.handle,
+                            "--thread", self.thread, "--lines", "200"])
+            if self.env == "orca":
+                data = orca_terminal(["read", "--terminal", self.handle, "--screen"])
+                return "\n".join(data.get("result", {}).get("terminal", {}).get("tail") or [])
+            return run(["tmux", "capture-pane", "-p", "-t", self.handle, "-S", "-200"])
+        except (RuntimeError, ValueError) as e:
             return f"<read 실패: {e}>"
 
     def close(self):
         try:
-            run([BIN / "collab-worker", "close", "--env", self.env, "--handle", self.handle])
+            if self.thread is not None:
+                run([BIN / "collab-worker", "close", "--env", self.env, "--handle", self.handle, "--thread", self.thread])
+            elif self.env == "orca":
+                orca_terminal(["close", "--terminal", self.handle])
+            else:
+                run(["tmux", "kill-pane", "-t", self.handle])
             log(f"닫음: {self.handle}")
-        except RuntimeError as e:
+            return True
+        except (RuntimeError, ValueError) as e:
             log(f"닫기 실패: {e}")
+            return False
+
+
+def finish_run(ws, evidence, terms, code, keep):
+    """종료 전에 화면을 남기고, 실패 시에는 진단을 포함한 workspace를 보존한다."""
+    for i, term in enumerate(terms):
+        try:
+            (evidence / f"terminal-{i}.txt").write_text(term.screen())
+        except Exception as exc:
+            (evidence / f"terminal-{i}.txt").write_text(f"화면 수집 실패: {exc}")
+    for term in reversed(terms):
+        try:
+            closed = term.close()
+        except Exception as exc:
+            log(f"닫기 실패: {exc}")
+            closed = False
+        if not closed:
+            code = code or 1
+    log(f"결과 코드 {code}")
+    if keep or code != 0:
+        log(f"보존: {ws} (진단: {evidence})")
+    else:
+        shutil.rmtree(ws)
+        # runner.log도 workspace와 함께 삭제되었으므로 stdout에만 기록한다.
+        print(f"[e2e {time.strftime('%H:%M:%S')}] 삭제: {ws}", flush=True)
+    return code
 
 
 def find_handle(data):
@@ -120,7 +184,13 @@ Approved plan: {req.name}
 
 - workspace: {ws}
 - 대상 저장소: {ws}
-- comm dir: {ws / 'docs' / '.comm'}
+- comm dir: {ws / '.comm'}
+- git·테스트 명령 cwd: {ws}
+- commit 주체: 없음 (E2E 임시 workspace)
+
+## baseline
+
+파일 생성·내용 확인만 하는 연결 시험이다. 기존 실패 수정이나 다른 테스트 삭제·약화는 승인하지 않는다.
 
 ## 결과물과 범위
 
@@ -158,6 +228,7 @@ def check_round(ws, reply, result_name, content, host, wterm, timeout):
 
 
 def main():
+    global RUN_LOG
     ap = argparse.ArgumentParser()
     ap.add_argument("--env", choices=["orca", "tmux"], required=True)
     ap.add_argument("--host", choices=["codex", "claude"], required=True)
@@ -171,18 +242,19 @@ def main():
     run_id = f"{a.env}-{a.host}-{time.strftime('%H%M%S')}"
     ws = ROOT / ".e2e" / run_id
     ws.mkdir(parents=True)
-    run([BIN / "collab-init", ws])
-    thread = ws / "docs" / ".comm" / "20261110-e2e"
-    thread.mkdir()
+    thread = ws / ".comm" / "20261110-e2e"
+    evidence = thread / "02-evidence"
+    evidence.mkdir(parents=True)
+    RUN_LOG = evidence / "runner.log"
     terms, code = [], 1
     try:
+        run([BIN / "collab-init", ws])
         if a.host == "claude":
             sock_file = ws / "host-socket.txt"
             prompt = ("E2E 연결 확인용 host 세션입니다. 지금 Bash로 "
                       "`printf %s \"$CLAUDE_CODE_MESSAGING_SOCKET\" > host-socket.txt` 하나만 실행하고 "
                       "'HOST-READY'라고만 답하세요. " + HOST_RULE)
-            host = Term(a.env, f"e2e-host-{run_id}", ws, shlex.join([str(BIN / "claude-host"), prompt]))
-            terms.append(host)
+            host = Term(a.env, f"e2e-host-{run_id}", ws, shlex.join([str(BIN / "claude-host"), prompt]), terms)
             sock = wait(lambda: sock_file.exists() and sock_file.read_text().strip(), 180)
             if not sock:
                 raise RuntimeError("host socket 경로를 얻지 못함\n" + host.screen())
@@ -195,8 +267,7 @@ def main():
             tid = next(json.loads(l)["thread_id"] for l in out.splitlines()
                        if l.startswith("{") and json.loads(l).get("type") == "thread.started")
             log(f"codex host thread: {tid}")
-            host = Term(a.env, f"e2e-host-{run_id}", ws, shlex.join(["codex", "resume", tid]))
-            terms.append(host)
+            host = Term(a.env, f"e2e-host-{run_id}", ws, shlex.join(["codex", "resume", tid]), terms)
             time.sleep(15)
             header = f"Codex thread: {tid}"
             notify_for = lambda r: shlex.join(["codex", "queue", "--thread", tid,
@@ -208,8 +279,7 @@ def main():
         write_request(req, reply, worker, header, notify_for(reply), ws, "e2e-result.txt", "ok")
         started = json.loads(run([BIN / "collab-worker", "start", "--env", a.env, "--worker", worker,
                                   "--workspace", ws, "--request", req, "--title", f"e2e-worker-{run_id}"]))
-        wterm = Term.__new__(Term)
-        wterm.env, wterm.handle = a.env, started["handle"]
+        wterm = Term.worker(a.env, started["handle"], thread)
         terms.append(wterm)
         log(f"worker 시작: {wterm.handle} send={json.dumps(started.get('send_result'), ensure_ascii=False)[:300]}")
         code = check_round(ws, reply, "e2e-result.txt", "ok", host, wterm, a.timeout)
@@ -218,24 +288,27 @@ def main():
             time.sleep(10)  # worker가 첫 턴을 마칠 시간
             if a.env == "tmux":
                 session = run(["tmux", "display-message", "-p", "-t", wterm.handle, "#{session_name}"]).strip()
-                run(["tmux", "new-window", "-t", f"={session}:", "-n", "user-other"])
+                other = run(["tmux", "new-window", "-t", f"={session}:", "-n", "user-other", "-P", "-F", "#{pane_id}"]).strip()
+                # 이 시험이 만든 보조 pane도 직접 소유한 대상으로만 정리한다.
+                terms.append(Term.worker("tmux", other, None))
                 active = run(["tmux", "display-message", "-p", "-t", f"={session}:", "#{pane_id}"]).strip()
                 log(f"worker session 활성 pane: {active} (worker handle {wterm.handle})")
             req2 = thread / f"03-{a.host}-request.md"
             reply2 = thread / f"04-{worker}-implementation.md"
             write_request(req2, reply2, worker, header, notify_for(reply2), ws, "e2e-result-2.txt", "ok2")
-            sent = run([BIN / "collab-worker", "send", "--env", a.env, "--handle", wterm.handle, "--request", req2])
+            sent = run([BIN / "collab-worker", "send", "--env", a.env, "--handle", wterm.handle,
+                        "--thread", thread, "--request", req2])
             log(f"후속 요청 전송: {' '.join(sent.split())[:300]}")
             code = check_round(ws, reply2, "e2e-result-2.txt", "ok2", host, wterm, a.timeout)
+    except Exception:
+        (evidence / "error.txt").write_text(traceback.format_exc())
+        log("중단: " + traceback.format_exc().splitlines()[-1])
+        code = 1
     finally:
-        for t in reversed(terms):
-            t.close()
-        if a.keep:
-            log(f"보존: {ws}")
-        else:
-            shutil.rmtree(ws, ignore_errors=True)
-            log(f"삭제: {ws}")
-        log(f"결과 코드 {code}")
+        try:
+            code = finish_run(ws, evidence, terms, code, a.keep)
+        finally:
+            RUN_LOG = None
     sys.exit(code)
 
 
