@@ -9,14 +9,21 @@ description: Claude Code host가 승인된 작업을 전용 Codex worker에게 �
 
 1. `plan-with-me`의 사용자 결정과 이후 지시를 읽는다. workspace·대상 저장소·comm dir(기본 `<workspace>/.comm`)을 정한다.
    host 시작 위치·로드한 지침을 workspace·대상과 대조하고, 다르면 해당 지침을 읽어 적용 규칙과 차이를 요청서에 인계한다.
-2. Bash 도구의 `$PPID`(Claude PID)로 `"<pkg>/bin/claude-host" --check-host "$PPID" --workspace "<workspace>"`를 실행한다.
+2. Bash 도구의 `CLAUDE_PID`를 우선하고, 없으면 `$PPID`를 대체값으로 쓴다.
+   `"<pkg>/bin/claude-host" --check-host "${CLAUDE_PID:-$PPID}" --workspace "<workspace>"`를 실행한다.
    이 진단은 `ps` 프로세스 인자의 inline `crossSessionInbound=accept`를 감지하고 재시작 명령을 출력만 한다.
    `accept_arg_detected` 외의 결과는 수신 설정 미적용·불명으로 취급한다. settings 파일 내용이나 managed 정책 적용 여부는 추정하지 않는다.
    `$CLAUDE_CODE_MESSAGING_SOCKET`가 비어 있으면 native inbox를 쓸 수 없음을 알린다.
    미감지·불명일 때는 다음 선택의 동작·영향과 진단의 `restart_command`를 먼저 설명하고 **선택 UI로** 결정받는다.
    - ① 이대로 진행: 알림이 승인 대화상자로 보류될 수 있으므로 회신 파일로 확인한다.
-   - ② 재시작 명령 제시: 사용자가 그대로 붙여 넣을 `cd "<workspace>" && "<pkg>/bin/claude-host" --continue` 명령을 제시한다.
+   - ② 재시작 명령 제시: 진단의 `restart_command`를 그대로 제시한다.
+     `CLAUDE_CODE_SESSION_ID`가 있으면 `cd "<workspace>" && "<pkg>/bin/claude-host" --resume "<그 ID>"`로 현재 대화를 지정한다.
+     확인 환경에서는 원래 시작 cwd가 달라도 workspace에서 이 ID로 재개할 수 있다.
+     ID가 없으면 `--continue`와 경고를 출력한다. 이는 workspace의 가장 최근 대화를 열므로,
+     원래 cwd나 최근 대화가 다르면 다른 대화가 열리거나 대화를 찾지 못할 수 있음을 설명한다.
      `ORCA_CLAUDE_AGENT_VIEW_PLUGIN_DIR`가 설정돼 있을 때만 `--plugin-dir "<그 값>"`을 포함한다. helper가 경로를 shell quote한다.
+     사용자는 출력된 명령을 먼저 복사하고 **기존 세션을 `/exit`로 종료한 뒤 셸에 붙여 넣어 실행**한다.
+     기존 세션이 열린 채로 실행하면 같은 대화를 두 프로세스가 열게 된다. print 모드(`claude -p`)로 만든 대화는 이 재시작 절차로 이어받을 수 없다.
    host가 스스로 재시작하거나 settings 파일을 고치지 않는다. 재시작하면 새 socket을 요청서에 사용한다.
 3. comm dir에 이 패키지의 `RULES.md`가 없으면 `"<pkg>/bin/collab-init" "<workspace>" --comm-dir "<comm dir>"` 적용 여부를 사용자에게 선택 UI로 묻는다. 직접 설치하지 않는다.
 4. 요청 전 baseline(기준 코드·기존 변경, 명령·cwd·결과·기존 실패와 처리 방침)을 확인하거나 같은 조건의 유효한 결과를 승계한다.

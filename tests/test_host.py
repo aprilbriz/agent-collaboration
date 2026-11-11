@@ -48,6 +48,7 @@ class HostLauncherTest(unittest.TestCase):
         self.stubbin.mkdir()
         self.env = dict(os.environ, PATH=f"{self.stubbin}:{os.environ['PATH']}")
         self.env.pop("ORCA_CLAUDE_AGENT_VIEW_PLUGIN_DIR", None)
+        self.env.pop("CLAUDE_CODE_SESSION_ID", None)
         self.make_stub("ps", 'import os\nprint(os.environ.get("STUB_ARGS", "claude"))\n')
         self.make_stub("claude", 'import json, os, sys\nprint(json.dumps({"argv":sys.argv[1:], "cwd":os.getcwd()}))\n')
 
@@ -72,6 +73,8 @@ class HostLauncherTest(unittest.TestCase):
         self.assertEqual(output["status"], "accept_arg_detected")
         self.assertEqual(shlex.split(output["restart_command"]),
                          ["cd", str(self.workspace), "&&", str(HOST.resolve()), "--continue"])
+        self.assertTrue(any("/exit" in warning for warning in output["warnings"]))
+        self.assertTrue(any("가장 최근 대화" in warning for warning in output["warnings"]))
 
     def test_restart_command_quotes_workspace_and_configured_plugin(self):
         plugin = str(self.root / "plugin '$HOME' `literal` $(none)")
@@ -87,6 +90,32 @@ class HostLauncherTest(unittest.TestCase):
         self.assertEqual(actual["cwd"], str(self.workspace))
         self.assertEqual(actual["argv"], ["--settings", '{"crossSessionInbound":"accept"}',
                                           "--continue", "--plugin-dir", plugin])
+
+    def test_restart_resumes_exact_session_and_preserves_quoted_arguments(self):
+        # Environment values must remain literal argv, even when they contain shell syntax.
+        session_id = "session '$HOME' `literal` $(none)"
+        plugin = str(self.root / "plugin '$HOME' `literal` $(none)")
+        self.env["CLAUDE_CODE_SESSION_ID"] = session_id
+        self.env["ORCA_CLAUDE_AGENT_VIEW_PLUGIN_DIR"] = plugin
+        output = self.diagnostic()
+        self.assertEqual(shlex.split(output["restart_command"]),
+                         ["cd", str(self.workspace), "&&", str(HOST.resolve()),
+                          "--resume", session_id, "--plugin-dir", plugin])
+        self.assertTrue(any("/exit" in warning for warning in output["warnings"]))
+        self.assertFalse(any("--continue" in warning for warning in output["warnings"]))
+        result = subprocess.run(["sh", "-c", output["restart_command"]], env=self.env,
+                                capture_output=True, text=True, check=True)
+        actual = json.loads(result.stdout)
+        self.assertEqual(actual["cwd"], str(self.workspace))
+        self.assertEqual(actual["argv"], ["--settings", '{"crossSessionInbound":"accept"}',
+                                          "--resume", session_id, "--plugin-dir", plugin])
+
+    def test_empty_session_id_falls_back_to_continue(self):
+        self.env["CLAUDE_CODE_SESSION_ID"] = ""
+        output = self.diagnostic()
+        self.assertEqual(shlex.split(output["restart_command"])[-1], "--continue")
+        self.assertTrue(any("CLAUDE_CODE_SESSION_ID가 없어" in warning
+                            for warning in output["warnings"]))
 
     def test_normal_arguments_pass_through_unchanged(self):
         argv = ["--model", "example", "prompt with spaces", "--settings", "custom.json"]

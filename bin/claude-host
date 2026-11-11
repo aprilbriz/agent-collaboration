@@ -45,9 +45,9 @@ def host_status(args):
     return "accept_arg_detected" if match.group(1) == "accept" else "not_detected"
 
 
-def restart_command(workspace, plugin_dir):
+def restart_command(workspace, plugin_dir, session_id=""):
     launcher = str(Path(__file__).resolve())
-    command = [launcher, "--continue"]
+    command = [launcher, "--resume", session_id] if session_id else [launcher, "--continue"]
     if plugin_dir:
         command.extend(["--plugin-dir", plugin_dir])
     return f"cd {shlex.quote(workspace)} && {shlex.join(command)}"
@@ -64,9 +64,16 @@ def main():
         process = subprocess.run(["ps", "-o", "args=", "-p", str(args.check_host)],
                                  capture_output=True, text=True)
         status = host_status(process.stdout.strip()) if process.returncode == 0 else "unknown"
+        session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        warnings = ["기존 세션을 먼저 /exit로 종료한 뒤 restart_command를 셸에 붙여 넣으세요."]
+        if not session_id:
+            warnings.append("CLAUDE_CODE_SESSION_ID가 없어 --continue를 사용합니다. "
+                            "workspace의 가장 최근 대화를 열므로 원래 cwd나 최근 대화가 다르면 "
+                            "다른 대화가 열리거나 대화를 찾지 못할 수 있습니다.")
         print(json.dumps({"status": status,
                           "restart_command": restart_command(args.workspace,
-                              os.environ.get("ORCA_CLAUDE_AGENT_VIEW_PLUGIN_DIR", ""))},
+                              os.environ.get("ORCA_CLAUDE_AGENT_VIEW_PLUGIN_DIR", ""), session_id),
+                          "warnings": warnings},
                          ensure_ascii=False))
         return
     # Preserve normal launcher pass-through; managed settings still take precedence.

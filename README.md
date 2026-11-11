@@ -56,18 +56,22 @@ cd "<workspace>" && "$PKG/bin/claude-host"    # Claude host (Orca·tmux 공통)
 일반 Claude host도 프로세스 인자로 수신 설정을 확인합니다. Claude의 Bash 도구에서:
 
 ```bash
-"$PKG/bin/claude-host" --check-host "$PPID" --workspace "<workspace>"
+"$PKG/bin/claude-host" --check-host "${CLAUDE_PID:-$PPID}" --workspace "<workspace>"
 ```
 
-진단은 실제 Claude argv의 inline `crossSessionInbound=accept`를 검사하고 `status`·`restart_command`를 출력합니다. 인자 확인은 managed 정책·실제 수신까지 보장하지 않습니다. 미감지·불명일 때 host는 선택 UI로 **① 현재 세션 계속**(알림이 승인 대화상자로 보류될 수 있어 회신 파일 확인) 또는 **② 재시작 명령 제시**를 선택받습니다. 자동 재시작하지 않습니다. 출력되는 명령의 형태는 다음과 같습니다.
+진단 PID는 `CLAUDE_PID`를 우선하고 `$PPID`를 대체값으로 씁니다. 진단은 실제 Claude argv의 inline `crossSessionInbound=accept`를 검사하고 `status`·`restart_command`·`warnings`를 출력합니다. 인자 확인은 managed 정책·실제 수신까지 보장하지 않습니다. 미감지·불명일 때 host는 선택 UI로 **① 현재 세션 계속**(알림이 승인 대화상자로 보류될 수 있어 회신 파일 확인) 또는 **② 재시작 명령 제시**를 선택받습니다. 자동 재시작하지 않습니다. `CLAUDE_CODE_SESSION_ID`가 있으면 출력되는 명령은 현재 대화를 ID로 지정합니다.
 
 ```bash
-cd "<workspace>" && "$PKG/bin/claude-host" --continue
+cd "<workspace>" && "$PKG/bin/claude-host" --resume "<CLAUDE_CODE_SESSION_ID 값>"
 # ORCA_CLAUDE_AGENT_VIEW_PLUGIN_DIR가 설정됐을 때만 위 명령 끝에 추가:
 # --plugin-dir "<ORCA_CLAUDE_AGENT_VIEW_PLUGIN_DIR 값>"
 ```
 
-helper는 실제 경로를 shell quote한 붙여 넣기용 명령을 생성합니다. 재시작하면 새 socket을 요청서에 기록합니다. launcher는 세션에만 수신 설정을 적용하며 전역·프로젝트 settings를 바꾸지 않습니다. 이 세션은 다른 로컬 Claude 세션의 메시지도 자동 수신하며, managed 설정이 막으면 우회하지 않습니다.
+helper는 실제 경로와 ID를 shell quote한 붙여 넣기용 명령을 생성합니다. 사용자는 이 명령을 먼저 복사하고 **기존 세션을 `/exit`로 종료한 뒤 셸에 붙여 넣어 실행**합니다. 기존 세션이 열린 채로 실행하면 같은 대화를 두 프로세스가 열게 됩니다.
+
+확인 환경에서는 원래 시작 cwd가 달라도 workspace에서 `--resume <ID>`로 같은 대화를 재개했습니다. ID가 없으면 helper는 `--continue`와 한계 경고를 출력합니다. `--continue`는 workspace의 가장 최근 대화를 열므로, 원래 cwd나 최근 대화가 다르면 다른 대화가 열리거나 대화를 찾지 못할 수 있습니다. print 모드(`claude -p`)로 만든 대화는 이 재시작 절차로 이어받을 수 없습니다.
+
+재시작하면 새 socket을 요청서에 기록합니다. launcher는 세션에만 수신 설정을 적용하며 전역·프로젝트 settings를 바꾸지 않습니다. 이 세션은 다른 로컬 Claude 세션의 메시지도 자동 수신하며, managed 설정이 막으면 우회하지 않습니다.
 
 host는 요청 전 baseline의 명령·cwd·결과·기존 실패 처리와 `commit 주체: host | user | 없음` 및 근거를 적습니다. worker는 기존 실패 수정, 요구와 승인 범위 충돌, 보안·회귀 가드 성격 테스트의 삭제·약화 전에 멈춰 질문합니다. 그 밖의 위임된 작업은 진행합니다.
 
