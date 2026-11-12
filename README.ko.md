@@ -30,7 +30,7 @@ Codex와 Claude Code 중 하나를 **host**(계획·검증), 다른 하나를 **
 
 ## 1. 프로젝트에 적용
 
-패키지를 원하는 위치에 두고 workspace마다 사용자가 한 번 실행합니다. 패키지를 옮기면 symlink를 다시 적용합니다.
+패키지를 원하는 위치에 두고 workspace마다 한 번 실행합니다. comm dir에 `RULES.md`가 없으면 host skill이 적용 여부를 묻고 승인받아 실행할 수도 있습니다. 패키지를 옮기면 symlink를 다시 적용합니다.
 
 ```bash
 PKG="/path/to/agent-collaboration"

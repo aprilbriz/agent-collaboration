@@ -1,5 +1,5 @@
 #!/bin/sh
-# 대상 workspace에 협업 패키지를 연결한다(사용자가 직접 실행).
+# 대상 workspace에 협업 패키지를 연결한다.
 #   collab-init "<workspace 절대경로>" [--comm-dir "<절대경로>"] [--dry-run]
 # - <comm dir>/RULES.md              -> 패키지 RULES.md (symlink)
 # - <workspace>/.agents/skills/...   -> plan-with-me, collaboration-with-claude (Codex host용)

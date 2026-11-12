@@ -32,7 +32,7 @@ User agrees on a plan → request stating the baseline and commit owner → dedi
 
 ## 1. Apply to a project
 
-Put the package anywhere and run this once per workspace. If you move the package, apply the symlinks again.
+Put the package anywhere and run this once per workspace. If the comm dir has no `RULES.md`, the host skill can also ask for approval and run it. If you move the package, apply the symlinks again.
 
 ```bash
 PKG="/path/to/agent-collaboration"

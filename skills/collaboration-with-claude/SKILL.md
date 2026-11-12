@@ -9,7 +9,7 @@ description: Codex host가 승인된 작업을 전용 Claude Code worker에게 �
 
 1. `plan-with-me`의 사용자 결정과 이후 지시를 읽는다. workspace·대상 저장소·comm dir(기본 `<workspace>/.comm`)을 정한다.
    host 시작 위치·로드한 지침을 workspace·대상과 대조하고, 다르면 해당 지침을 읽어 적용 규칙과 차이를 요청서에 인계한다.
-   comm dir에 이 패키지의 `RULES.md`가 없으면 `"<pkg>/bin/collab-init" "<workspace>" --comm-dir "<comm dir>"` 적용 여부를 사용자에게 선택 UI로 묻는다. 직접 설치하지 않는다.
+   comm dir에 이 패키지의 `RULES.md`가 없으면 `"<pkg>/bin/collab-init" "<workspace>" --comm-dir "<comm dir>"` 적용 여부를 사용자에게 선택 UI로 묻고, 승인하면 host가 실행한다.
 2. 요청 전 baseline(기준 코드·기존 변경, 명령·cwd·결과·기존 실패와 처리 방침)을 확인하거나 같은 조건의 유효한 결과를 승계한다.
    `templates/request.md`로 `01-codex-request.md`를 작성한다. 경로·git/테스트 cwd·commit 주체와 근거를 명시한다.
    worker가 기존 실패 수정 / 요구와 승인 범위 충돌 / 보안·회귀 가드 성격 테스트 삭제·약화 전에 멈춰 질문하도록 적는다.
