@@ -3,11 +3,12 @@
 
   python3 tests/e2e_roundtrip.py --env orca|tmux --host codex|claude [--followup] [--keep]
 
-- 이 저장소의 `.e2e/<run>/` 임시 workspace(collab-init 적용)에서만 실행한다. 실제 모델 호출이 발생한다.
+- 이 저장소의 `.e2e/<run>/` 임시 workspace에서만 실행한다. 실제 모델 호출이 발생한다.
 - host 세션
-  - claude: `bin/claude-host`로 시작하고, host가 Bash로 자기 CLAUDE_CODE_MESSAGING_SOCKET을 파일에 적는다.
+  - claude: `claude --plugin-dir <이 저장소>`로 plugin을 불러와 시작한다. host는 회신마다
+    `collab.py wait`를 background로 실행하고 턴을 마친다. 완료 표시(`<회신>.done`)로 깨어나야 한다.
   - codex: `codex exec`로 thread를 만들고(thread id 확보) 같은 thread를 `codex resume <id>`로 대화형 host로 띄운다.
-- worker는 `bin/collab-worker start`로 띄우고 요청 한 줄만 보낸다(helper의 전용 worker 기본 인자 그대로).
+- worker는 `collab.py start`로 띄우고 요청 한 줄만 보낸다(helper의 전용 worker 기본 인자 그대로).
 - 판정: 회신 파일 생성 + `e2e-result.txt` 내용이 정확히 `ok` 한 줄 + host 화면에 `HOST-RECEIVED <회신 경로>`가 보이면 0.
   `--followup`이면 같은 worker에 `collab-worker send`로 03 요청을 보내 04 회신·`ok2`·host 수신까지 같은 기준으로 본다.
   결과 내용이 다르면 1, 회신은 있으나 host 수신이 보이지 않으면 두 화면을 출력하고 3으로 끝낸다.
@@ -27,7 +28,7 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / "bin"
+COLLAB = [sys.executable, ROOT / "skills/collaborate/scripts/collab.py"]
 RUN_LOG = None
 
 
@@ -85,10 +86,21 @@ class Term:
         term.env, term.handle, term.thread = env, handle, thread
         return term
 
+    def type(self, text):
+        """이 스크립트가 직접 만든 host terminal에만 쓴다."""
+        if self.thread is not None:
+            raise RuntimeError("helper가 기록한 worker에는 직접 입력하지 않습니다")
+        if self.env == "orca":
+            orca_terminal(["send", "--terminal", self.handle, "--text", text, "--enter"])
+        else:
+            run(["tmux", "send-keys", "-t", self.handle, "-l", text])
+            time.sleep(0.5)
+            run(["tmux", "send-keys", "-t", self.handle, "Enter"])
+
     def screen(self):
         try:
             if self.thread is not None:
-                return run([BIN / "collab-worker", "read", "--env", self.env, "--handle", self.handle,
+                return run([*COLLAB, "read", "--env", self.env, "--handle", self.handle,
                             "--thread", self.thread, "--lines", "200"])
             if self.env == "orca":
                 data = orca_terminal(["read", "--terminal", self.handle, "--screen"])
@@ -100,7 +112,7 @@ class Term:
     def close(self):
         try:
             if self.thread is not None:
-                run([BIN / "collab-worker", "close", "--env", self.env, "--handle", self.handle, "--thread", self.thread])
+                run([*COLLAB, "close", "--env", self.env, "--handle", self.handle, "--thread", self.thread])
             elif self.env == "orca":
                 orca_terminal(["close", "--terminal", self.handle])
             else:
@@ -162,6 +174,31 @@ def wait(pred, timeout, every=3):
 
 HOST_RULE = ("이후 '회신 완료:'가 포함된 메시지를 받으면 도구를 쓰지 말고 "
              "'HOST-RECEIVED <메시지에 있는 파일 절대경로>' 한 줄만 답하세요.")
+
+
+def host_prompt_file(round_no):
+    return f"host-prompt-{round_no}.md"
+
+
+def host_launch_prompt(round_no):
+    """터미널 한 줄 입력 한도를 넘지 않도록 회차 지시문은 파일로 전달한다."""
+    return f"{host_prompt_file(round_no)} 파일을 읽고 그대로 따르세요."
+
+
+HOST_LAUNCH_PROMPT = host_launch_prompt(1)
+
+
+def claude_host_prompt(thread, reply):
+    """판정 문자열(`HOST-RECEIVED <회신 경로>`)이 지시문 자체에 나타나지 않게 쓴다.
+
+    지시문이 화면에 보여도 host 수신으로 오인하지 않도록, host는 wait 출력의 reply 값을 붙여 답한다.
+    실제 skill처럼 회차마다 host가 직접 wait를 background로 건다.
+    """
+    command = shlex.join(map(str, [*COLLAB, "wait", "--thread", thread, "--reply", reply]))
+    return ("# E2E host 지시\n\nE2E 연결 확인용 host 세션입니다. 다른 작업은 하지 말고 다음만 하세요.\n\n"
+            f"1. Bash 도구의 run_in_background로 아래 명령을 실행하고 바로 턴을 마치세요.\n   `{command}`\n"
+            "2. 그 작업이 끝났다는 알림을 받으면, 출력 JSON의 status가 done일 때 도구를 더 쓰지 말고\n"
+            "   `HOST-RECEIVED` 뒤에 공백 하나와 출력 JSON의 reply 값을 붙인 한 줄만 답하세요.\n")
 
 
 def write_request(req, reply, worker, header, notify, ws, result_name, content):
@@ -248,19 +285,18 @@ def main():
     RUN_LOG = evidence / "runner.log"
     terms, code = [], 1
     try:
-        run([BIN / "collab-init", ws])
+        replies = [thread / f"02-{worker}-implementation.md"]
+        if a.followup:
+            replies.append(thread / f"04-{worker}-implementation.md")
         if a.host == "claude":
-            sock_file = ws / "host-socket.txt"
-            prompt = ("E2E 연결 확인용 host 세션입니다. 지금 Bash로 "
-                      "`printf %s \"$CLAUDE_CODE_MESSAGING_SOCKET\" > host-socket.txt` 하나만 실행하고 "
-                      "'HOST-READY'라고만 답하세요. " + HOST_RULE)
-            host = Term(a.env, f"e2e-host-{run_id}", ws, shlex.join([str(BIN / "claude-host"), prompt]), terms)
-            sock = wait(lambda: sock_file.exists() and sock_file.read_text().strip(), 180)
-            if not sock:
-                raise RuntimeError("host socket 경로를 얻지 못함\n" + host.screen())
-            header = f"Claude socket: {sock}"
-            notify_for = lambda r: shlex.join([str(BIN / "notify-claude"), "--socket", sock,
-                                               "--message", f"Codex 회신 완료: {r}"])
+            for round_no, reply_path in enumerate(replies, 1):
+                (ws / host_prompt_file(round_no)).write_text(claude_host_prompt(thread, reply_path))
+            host = Term(a.env, f"e2e-host-{run_id}", ws, shlex.join(
+                ["claude", "--plugin-dir", str(ROOT), "--dangerously-skip-permissions", HOST_LAUNCH_PROMPT]), terms)
+            # host가 첫 wait를 background로 띄울 시간. 완료 표시가 먼저 생겨도 wait는 즉시 끝나므로 순서는 판정에 영향이 없다.
+            time.sleep(20)
+            header_for = lambda r: f"Completion marker: {r}.done"
+            notify_for = lambda r: shlex.join(["touch", f"{r}.done"])
         else:
             out = run(["codex", "exec", "--json", "-C", ws,
                        "E2E 연결 확인용 host 세션입니다. 'READY'라고만 답하세요. " + HOST_RULE])
@@ -269,15 +305,15 @@ def main():
             log(f"codex host thread: {tid}")
             host = Term(a.env, f"e2e-host-{run_id}", ws, shlex.join(["codex", "resume", tid]), terms)
             time.sleep(15)
-            header = f"Codex thread: {tid}"
+            header_for = lambda r: f"Codex thread: {tid}"
             notify_for = lambda r: shlex.join(["codex", "queue", "--thread", tid,
                                                "--message", f"Claude 회신 완료: {r}"])
-        log(f"host 준비: {host.handle} ({header})")
+        log(f"host 준비: {host.handle}")
 
         req = thread / f"01-{a.host}-request.md"
-        reply = thread / f"02-{worker}-implementation.md"
-        write_request(req, reply, worker, header, notify_for(reply), ws, "e2e-result.txt", "ok")
-        started = json.loads(run([BIN / "collab-worker", "start", "--env", a.env, "--worker", worker,
+        reply = replies[0]
+        write_request(req, reply, worker, header_for(reply), notify_for(reply), ws, "e2e-result.txt", "ok")
+        started = json.loads(run([*COLLAB, "start", "--env", a.env, "--worker", worker,
                                   "--workspace", ws, "--request", req, "--title", f"e2e-worker-{run_id}"]))
         wterm = Term.worker(a.env, started["handle"], thread)
         terms.append(wterm)
@@ -293,10 +329,13 @@ def main():
                 terms.append(Term.worker("tmux", other, None))
                 active = run(["tmux", "display-message", "-p", "-t", f"={session}:", "#{pane_id}"]).strip()
                 log(f"worker session 활성 pane: {active} (worker handle {wterm.handle})")
+            if a.host == "claude":
+                host.type(host_launch_prompt(2))  # 스크립트가 만든 host에게만 입력한다
+                time.sleep(15)
             req2 = thread / f"03-{a.host}-request.md"
-            reply2 = thread / f"04-{worker}-implementation.md"
-            write_request(req2, reply2, worker, header, notify_for(reply2), ws, "e2e-result-2.txt", "ok2")
-            sent = run([BIN / "collab-worker", "send", "--env", a.env, "--handle", wterm.handle,
+            reply2 = replies[1]
+            write_request(req2, reply2, worker, header_for(reply2), notify_for(reply2), ws, "e2e-result-2.txt", "ok2")
+            sent = run([*COLLAB, "send", "--env", a.env, "--handle", wterm.handle,
                         "--thread", thread, "--request", req2])
             log(f"후속 요청 전송: {' '.join(sent.split())[:300]}")
             code = check_round(ws, reply2, "e2e-result-2.txt", "ok2", host, wterm, a.timeout)

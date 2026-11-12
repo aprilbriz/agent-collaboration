@@ -1,0 +1,14 @@
+{
+  "name": "agent-collaboration",
+  "description": "Codex·Claude Code host/worker 협업 plugin marketplace",
+  "owner": {
+    "name": "aprilbriz"
+  },
+  "plugins": [
+    {
+      "name": "agent-collaboration",
+      "source": "./",
+      "description": "Codex와 Claude Code를 host·전용 worker로 묶는 협업 workflow"
+    }
+  ]
+}

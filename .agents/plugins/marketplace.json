@@ -1,0 +1,11 @@
+{
+  "name": "agent-collaboration",
+  "plugins": [
+    {
+      "name": "agent-collaboration",
+      "source": { "source": "local", "path": "./" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_USE" },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""전용 worker를 시작하고 thread의 생성 기록과 실행 인스턴스를 대조해 통신한다.
+"""협업 thread를 만들고 전용 worker를 시작·대조·대기·종료한다(collaborate skill helper).
 
-입력은 항상 "<요청서 절대경로> — RULES.md 준수" 한 줄이다.
+host agent가 `python3 <skill>/scripts/collab.py <command>`로 실행한다. 사용자가 직접 실행할 필요는 없다.
+worker 입력은 항상 "<요청서 절대경로> — <RULES.md 절대경로> 준수" 한 줄이다.
 전송 접수·turn 시작 관찰은 완료 판정이 아니다. helper는 자동 재전송·종료하지 않는다.
 """
 import argparse
@@ -18,7 +19,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+SKILL_DIR = Path(__file__).resolve().parent.parent
+RULES = SKILL_DIR / "RULES.md"
+TEMPLATES = SKILL_DIR / "templates"
 TMUX_PREFIX = "collab-"
+DONE_SUFFIX = ".done"
 RECORD_NAME = "worker-record.json"
 HISTORY_DIR = "worker-record-history"
 WORKER_DEFAULT_ARGS = {
@@ -39,13 +44,17 @@ def fail(message, code=2, data=None):
 
 
 def request_line(request):
-    return f"{request} — RULES.md 준수"
+    return f"{request} — {RULES} 준수"
+
+
+def self_command(*args):
+    return shlex.join(["python3", str(Path(__file__).resolve()), *args])
 
 
 def check_thread(thread):
     p = Path(thread)
-    if not p.is_absolute() or not p.is_dir() or not (p.parent / "RULES.md").is_file():
-        fail(f"thread는 comm RULES.md 아래 존재하는 절대경로여야 합니다: {thread}")
+    if not p.is_absolute() or not p.is_dir():
+        fail(f"thread는 존재하는 절대경로 폴더여야 합니다: {thread}")
     return p.resolve()
 
 
@@ -156,9 +165,8 @@ def read_saved_record(thread, env=None, handle=None):
 
 
 def recovery_hint(thread, env, handle):
-    command = shlex.join([str(Path(__file__).resolve()), "mark-closed", "--env", env,
-                          "--handle", handle, "--thread", str(thread), "--closed-by-user",
-                          "--reason", "<직접 종료를 확인한 사유>"])
+    command = self_command("mark-closed", "--env", env, "--handle", handle, "--thread", str(thread),
+                           "--closed-by-user", "--reason", "<직접 종료를 확인한 사유>")
     return ("원래 worker의 종료를 직접 확인하세요. 남아 있으면 Orca/tmux에서 직접 닫은 뒤 "
             "기록만 정리하세요(terminal을 자동 조작하지 않음): " + command)
 
@@ -352,8 +360,8 @@ def cmd_start(a):
     if record_path(thread).exists() or record_path(thread).is_symlink():
         previous, previous_raw = read_saved_record(thread)
         if previous.get("status") != "closed":
-            close_command = shlex.join([str(Path(__file__).resolve()), "close", "--env", previous["env"],
-                                        "--handle", previous["handle"], "--thread", str(thread)])
+            close_command = self_command("close", "--env", previous["env"],
+                                         "--handle", previous["handle"], "--thread", str(thread))
             fail("이 thread에 아직 닫히지 않은 worker 기록이 이미 있습니다. 먼저 close하세요: "
                  + close_command)
     cli = shutil.which(a.worker)
@@ -539,9 +547,112 @@ def cmd_mark_closed(a):
           "terminal_modified": False, "reason": reason})
 
 
+def git_exclude(path):
+    """path가 git 저장소 안이고 아직 무시되지 않으면 그 저장소의 .git/info/exclude에 추가한다."""
+    try:
+        top = subprocess.run(["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True)
+    except OSError:
+        return None
+    if top.returncode:
+        return None
+    top = Path(top.stdout.strip()).resolve()
+    if path == top:
+        return None
+    rel = path.relative_to(top).as_posix()
+    if subprocess.run(["git", "-C", str(top), "check-ignore", "-q", "--no-index", rel]).returncode == 0:
+        return None
+    exclude = subprocess.run(["git", "-C", str(top), "rev-parse", "--git-path", "info/exclude"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    exclude = (top / exclude) if not Path(exclude).is_absolute() else Path(exclude)
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a") as stream:
+        stream.write(f"/{rel}\n")
+    return str(exclude)
+
+
+def cmd_thread(a):
+    ws = Path(a.workspace)
+    if not ws.is_absolute() or not ws.is_dir():
+        fail(f"workspace는 존재하는 절대경로여야 합니다: {a.workspace}")
+    comm = Path(a.comm_dir) if a.comm_dir else ws.resolve() / ".comm"
+    if not comm.is_absolute():
+        fail(f"comm dir은 절대경로여야 합니다: {a.comm_dir}")
+    topic = re.sub(r"[^\w-]+", "-", a.topic).strip("-")
+    if not topic:
+        fail(f"thread 주제가 비어 있습니다: {a.topic!r}")
+    thread = comm / f"{datetime.now().strftime('%Y%m%d')}-{topic}"
+    if thread.exists() and not a.existing:
+        fail(f"thread가 이미 있습니다. 이어 쓰려면 --existing을 붙이세요: {thread}")
+    thread.mkdir(parents=True, exist_ok=True)
+    comm = comm.resolve()
+    excluded = git_exclude(comm)
+    emit({"thread": str(thread.resolve()), "comm_dir": str(comm), "git_exclude": excluded,
+          "rules": str(RULES), "templates": str(TEMPLATES)})
+
+
+def worker_alive(record):
+    try:
+        verify_worker(record["thread"], record["env"], record["handle"])
+        return True, None
+    except (WorkerError, OSError) as error:
+        return False, str(error)
+
+
+def cmd_wait(a):
+    """완료 표시(<회신>.done)가 생길 때까지 기다린다. Claude host가 background로 실행한다."""
+    thread = check_thread(a.thread)
+    reply = Path(a.reply)
+    if not reply.is_absolute() or reply.parent.resolve() != thread:
+        fail(f"회신 경로는 thread 안의 절대경로여야 합니다: {a.reply}")
+    done = reply.parent.resolve() / (reply.name + DONE_SUFFIX)
+    started = time.monotonic()
+    last_check = started
+    failures = 0
+    while True:
+        if done.exists():
+            emit({"status": "done", "reply": str(reply), "reply_exists": reply.exists(),
+                  "marker": str(done)})
+            return 0
+        now = time.monotonic()
+        if a.timeout and now - started >= a.timeout:
+            emit({"status": "timeout", "reply": str(reply), "reply_exists": reply.exists(),
+                  "waited_seconds": int(now - started)})
+            return 4
+        if a.check_worker and now - last_check >= a.check_every:
+            last_check = now
+            try:
+                record, _ = read_saved_record(thread)
+            except WorkerError:
+                record = None
+            if record and record.get("status") != "closed":
+                alive, error = worker_alive(record)
+                failures = 0 if alive else failures + 1
+                # 순간적인 조회 실패로 깨우지 않도록 연속 2회 실패해야 알린다.
+                if failures >= 2:
+                    emit({"status": "worker-unavailable", "reply": str(reply),
+                          "reply_exists": reply.exists(), "handle": record["handle"], "error": error})
+                    return 3
+        time.sleep(a.interval)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("thread", help="comm dir 아래 새 thread 폴더를 만들고 RULES·템플릿 경로를 알려 준다")
+    p.add_argument("--workspace", required=True)
+    p.add_argument("--topic", required=True)
+    p.add_argument("--comm-dir", help="기본값 <workspace>/.comm")
+    p.add_argument("--existing", action="store_true", help="같은 날짜·주제 thread가 있으면 그대로 쓴다")
+    p.set_defaults(fn=cmd_thread)
+    p = sub.add_parser("wait", help="<회신>.done 완료 표시를 기다린다(Claude host가 background로 실행)")
+    p.add_argument("--thread", required=True)
+    p.add_argument("--reply", required=True)
+    p.add_argument("--interval", type=float, default=5)
+    p.add_argument("--timeout", type=float, default=0, help="초, 0이면 무제한")
+    p.add_argument("--check-every", type=float, default=60, help="worker terminal 생존 확인 간격(초)")
+    p.add_argument("--no-check-worker", dest="check_worker", action="store_false")
+    p.set_defaults(fn=cmd_wait)
     p = sub.add_parser("start", help="전용 worker를 만들고 thread에 생성 기록을 남긴다")
     p.add_argument("--env", choices=["orca", "tmux"], required=True)
     p.add_argument("--worker", choices=["claude", "codex"], required=True)
@@ -575,14 +686,13 @@ def main():
     p.set_defaults(fn=cmd_mark_closed)
     args = parser.parse_args()
     try:
-        args.fn(args)
+        return args.fn(args) or 0
     except WorkerError as error:
-        print(f"collab-worker: {error}", file=sys.stderr)
+        print(f"collab: {error}", file=sys.stderr)
         return error.code
     except OSError as error:
-        print(f"collab-worker: {error}", file=sys.stderr)
+        print(f"collab: {error}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":

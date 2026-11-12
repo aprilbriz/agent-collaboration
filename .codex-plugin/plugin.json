@@ -1,0 +1,15 @@
+{
+  "name": "agent-collaboration",
+  "version": "0.1.0",
+  "description": "Codex와 Claude Code를 host·전용 worker로 묶는 협업 workflow (plan-with-me, collaborate)",
+  "author": { "name": "aprilbriz" },
+  "repository": "https://github.com/aprilbriz/agent-collaboration",
+  "keywords": ["collaboration", "claude", "worker", "orca", "tmux"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Collaboration",
+    "shortDescription": "Codex host와 전용 Claude Code worker 협업",
+    "developerName": "aprilbriz",
+    "category": "Productivity"
+  }
+}

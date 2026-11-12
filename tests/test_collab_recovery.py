@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("collab_worker_recovery", str(ROOT / "bin/collab-worker"))
+loader = importlib.machinery.SourceFileLoader("collab_worker_recovery", str(ROOT / "skills/collaborate/scripts/collab.py"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 worker = importlib.util.module_from_spec(spec)
 loader.exec_module(worker)
@@ -34,7 +34,6 @@ class WorkerRecoveryTest(unittest.TestCase):
         self.workspace = Path(self.temp.name).resolve()
         self.comm = self.workspace / ".comm"
         self.comm.mkdir()
-        (self.comm / "RULES.md").write_text("rules")
         self.thread = self.comm / "thread with spaces"
         self.thread.mkdir()
         self.request = self.thread / "01-request.md"
@@ -208,7 +207,7 @@ class WorkerRecoveryTest(unittest.TestCase):
 
     def test_cli_missing_confirmation_or_reason_exits_two_without_mutation(self):
         _, raw = self.seed(status="failed")
-        base = [str(ROOT / "bin/collab-worker"), "mark-closed", "--env", "orca", "--handle", "term-old",
+        base = [str(ROOT / "skills/collaborate/scripts/collab.py"), "mark-closed", "--env", "orca", "--handle", "term-old",
                 "--thread", str(self.thread)]
         for incomplete in (["--reason", "manual close"], ["--closed-by-user"]):
             result = subprocess.run([*base, *incomplete], capture_output=True, text=True)

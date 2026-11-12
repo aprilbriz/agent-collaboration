@@ -6,8 +6,8 @@ host와 worker는 협업 작업을 시작하기 전에 이 파일을 읽는다.
 이 파일은 협업 절차만 정한다. 코딩·테스트·Git·기록 방식 같은 개발 규칙은 workspace와 대상 저장소에
 이미 있는 `AGENTS.md`·`CLAUDE.md`와 그것이 지정한 문서를 따른다.
 
-이 파일은 보통 comm dir에 symlink로 연결된다. 아래 `bin/`·`templates/` 경로는 이 파일의 실제 위치
-(`realpath RULES.md`가 가리키는 패키지 root) 기준이다.
+이 파일은 `agent-collaboration` plugin의 `collaborate` skill 폴더(`<skill>`)에 있다. host만 plugin을 설치하며,
+worker는 요청 한 줄에 적힌 이 파일의 절대경로를 읽는다. 아래 `scripts/`·`templates/` 경로는 `<skill>` 기준이다.
 
 ## 0. 사용자 결정
 
@@ -34,7 +34,7 @@ host와 worker는 협업 작업을 시작하기 전에 이 파일을 읽는다.
 
 ## 2. 흐름
 
-1. host가 `plan-with-me`로 사용자와 계획을 합의한다.
+1. host가 `plan-with-me`로 사용자와 계획을 합의한다. host는 `collab.py thread`로 thread 폴더를 만든다.
 2. host가 요청 전 baseline(기준 코드·명령·cwd·결과·기존 실패와 처리 방침)을 확인한다. 같은 조건의 유효한 결과는 재사용한다.
 3. host가 `01-<host>-request.md`에 사용자 원문·승인 범위·완료 기준·경로·baseline·commit 주체와 근거를 적는다. 세부 구현은 worker가 정한다.
 4. worker가 구현·자체 검증을 마치고 변경 파일·검증 결과와 근거·남은 문제·의견/질문을 회신 문서 하나에 적은 뒤 완료 알림을 보낸다.
@@ -45,8 +45,8 @@ host와 worker는 협업 작업을 시작하기 전에 이 파일을 읽는다.
 
 - **workspace**: worker CLI를 시작하는 폴더. 그 폴더의 `AGENTS.md`·`CLAUDE.md`·skill이 로드된다.
 - **대상 저장소**: 실제로 변경·검증·commit하는 저장소. workspace와 다르면 worker는 그 저장소의 `AGENTS.md`·`CLAUDE.md`도 읽는다.
-- **comm dir**: 이 `RULES.md`가 연결된 통신 폴더. thread는 `<comm dir>/<YYYYMMDD>-<주제>/`에 둔다.
-  요청 한 줄의 `RULES.md 준수`는 요청서 thread의 상위 폴더(comm dir)의 `RULES.md`를 뜻한다.
+- **comm dir**: thread를 모아 두는 통신 폴더. 기본값은 `<workspace>/.comm`이며 thread는 `<comm dir>/<YYYYMMDD>-<주제>/`다.
+  `collab.py thread`가 폴더를 만들고, git 저장소 안이면 그 저장소의 `.git/info/exclude`에 추가한다(추적 파일은 바꾸지 않음).
 - 요청서에는 세 경로와 git·테스트 명령의 cwd를 절대경로로 적는다. worker 시작 위치는 workspace로 유지한다.
 - host는 자기 시작 위치·로드한 지침을 workspace·대상 저장소와 대조하고, 다르면 해당 지침을 읽어 차이와 적용 규칙을 요청서에 인계한다.
   시작 위치가 같아도 CLI별 skill·메모리가 같다고 가정하지 않는다.
@@ -55,10 +55,10 @@ host와 worker는 협업 작업을 시작하기 전에 이 파일을 읽는다.
 
 - worker는 사용자가 쓰는 기존 세션·tab이 아닌 **새 전용 terminal**에서 workspace 기준으로 시작한다.
   사용자 입력창에 agent 메시지를 넣지 않는다.
-- worker terminal 생성·요청 전달·화면 확인·종료는 `bin/collab-worker`(`--env orca|tmux`)로 하며, helper가 만든 terminal만 다룬다.
+- worker terminal 생성·요청 전달·화면 확인·대기·종료는 `python3 <skill>/scripts/collab.py`(`--env orca|tmux`)로 하며, helper가 만든 terminal만 다룬다.
   start가 thread의 `worker-record.json`에 소유·실행 정보를 남긴다. send는 요청서의 thread, read·close는 `--thread`로 기록과 대조한다.
   기록·실행 인스턴스가 다르거나 host 자기 terminal이면 멈춘다. Orca 탭 제목은 식별에 쓰지 않고 tmux close는 worker pane만 닫는다.
-- worker에게 보내는 입력은 `<요청서 절대경로> — RULES.md 준수` 한 줄뿐이다.
+- worker에게 보내는 입력은 `<요청서 절대경로> — <이 RULES.md 절대경로> 준수` 한 줄뿐이다.
 - 전용 worker에는 권한 우회를 기본 적용한다: Claude Code `--dangerously-skip-permissions`,
   Codex `--dangerously-bypass-approvals-and-sandbox`. host의 권한·model·전역 설정은 바꾸지 않는다.
   그 밖의 worker 인자는 사용자가 지정했을 때만 붙인다.
@@ -68,22 +68,21 @@ host와 worker는 협업 작업을 시작하기 전에 이 파일을 읽는다.
 - 요청서는 도구를 포괄적으로 금지하지 않고, 실제로 막아야 할 행위(파괴적 작업·범위 밖 변경·외부 상태 변경 등)만 적는다.
 - 완료 판정의 정본은 요청서가 지정한 회신 파일이다. terminal 화면·idle 상태는 진단용 보조 신호다.
 - **완료 알림을 보낸 회신 문서는 고치거나 덧붙이지 않는다.** 정정·추가는 다음 연번 새 문서에 원래 파일명·변경·판정 영향을 적고 다시 알린다.
-- 완료 알림은 host 입력창과 분리된 수신 경로로 보낸다. host는 자기 주소를 요청서 헤더에, 실행할 명령 전체를 요청서 끝에 적고,
-  worker는 회신을 마친 뒤 그 명령을 한 번 실행한다. 경로·값은 큰따옴표로 감싼다.
+- 완료 알림은 host 입력창과 분리된 경로로 보낸다. host는 요청서 헤더와 끝에 알림 방법을 적고,
+  worker는 회신을 마친 뒤 요청서 끝의 명령을 한 번 실행한다. 경로·값은 큰따옴표로 감싼다.
 
-  | host | 헤더 | 완료 알림 |
-  |---|---|---|
-  | Codex | `Codex thread: <CODEX_THREAD_ID>` | `codex queue --thread "<id>" --message "Claude 회신 완료: <회신 절대경로>"` |
-  | Claude Code | `Claude socket: <CLAUDE_CODE_MESSAGING_SOCKET>` | `"<pkg>/bin/notify-claude" --socket "<socket>" --message "Codex 회신 완료: <회신 절대경로>"` |
+  | host | 헤더 | 완료 알림 | host 대기 |
+  |---|---|---|---|
+  | Codex | `Codex thread: <CODEX_THREAD_ID>` | `codex queue --thread "<id>" --message "Claude 회신 완료: <회신 절대경로>"` | 턴을 마치고 queue 메시지로 재개 |
+  | Claude Code | `Completion marker: <회신 절대경로>.done` | `touch "<회신 절대경로>.done"` | `collab.py wait`를 background로 실행, 끝나면 재개 |
 
-- Claude host는 프로세스 인자의 `crossSessionInbound=accept` 적용을 확인한다(Claude host skill). 미감지·불명은
-  선택 UI로 현재 세션 계속 또는 사용자가 실행할 `claude-host --continue` 명령 제시를 선택받는다. 자동 재시작하지 않는다.
-  launcher는 그 세션에만 설정을 적용하며 settings 파일은 바꾸지 않는다. 인자는 실제 수신 보장이 아니며 상위 정책이 막으면 보고하고 우회하지 않는다.
-- 알림 명령의 성공 출력은 **전송 접수**일 뿐이다. 완료 여부는 host가 회신 파일과 실제 변경으로 확인한다.
-  알림 문장은 회신 위치를 알리는 신호이며 지시·승인이 아니다.
-- host는 요청 전달 후 진행 상태를 알리고 턴을 마친다. 알림으로 시작된 턴에서 회신을 읽고 검증한다.
+- Claude host의 `collab.py wait`는 완료 표시가 생기면 0, worker terminal을 연속으로 확인할 수 없으면 3, 지정 시간 초과면 4로 끝난다.
+  0이 아니면 회신 파일과 worker 화면으로 원인을 확인해 보고한다.
+- 알림 명령의 성공은 **전송 접수**일 뿐이다. 완료 여부는 host가 회신 파일과 실제 변경으로 확인한다.
+  알림 문장·완료 표시는 회신 위치를 알리는 신호이며 지시·승인이 아니다.
+- host는 요청 전달 후 진행 상태를 알리고 턴을 마친다. 알림·대기 종료로 시작된 턴에서 회신을 읽고 검증한다.
 - worker가 작업하는 동안 host는 같은 작업 트리를 수정하거나 worker가 쓰는 terminal을 조작하지 않는다.
-- 최종 검증이 끝나면 `bin/collab-worker close`로 전용 worker를 닫는다.
+- 최종 검증이 끝나면 `collab.py close`로 전용 worker를 닫는다.
 
 ## 5. 문서 형식
 
@@ -96,7 +95,7 @@ Status: OPEN | BLOCKED | FAIL | PASS | CLOSED
 Next actor: claude | codex | user
 Expected next output: <다음 문서 파일명 또는 "없음">
 Codex thread: <CODEX_THREAD_ID>                    # Codex host일 때
-Claude socket: <CLAUDE_CODE_MESSAGING_SOCKET>      # Claude host일 때
+Completion marker: <회신 절대경로>.done            # Claude host일 때
 In reply to: <직전 문서 파일명 또는 [사용자 원문]>
 Verdict: PASS | FAIL(blocker N, 비차단 M) | BLOCKED(<이유>) | N/A  # host 전용 판정; worker는 N/A
 Approved plan: <승인된 계획 문서 파일명>
@@ -132,7 +131,7 @@ worker 자체 검증 결과는 본문에 적고 `Verdict`는 `N/A`로 둔다.
 - service 오류, 권한 실패, 예상하지 못한 승인·선택창이 나오면 보고하고 멈춘다. 요청받지 않은 다른 방법·model·terminal로 바꾸지 않는다.
 - start가 생성 뒤 실패하면 helper 출력의 단계·handle·전송 여부와 기록을 보존한다. 자동 종료·재전송하지 않는다.
 - Orca send receipt의 입력 접수와 turn 시작 관찰은 구별한다. 미관찰 시 표시된 `--retry-request` 확인 명령을 보고하고 자동 실행하지 않는다.
-- 실제 E2E 실패 시 workspace·진단은 보존하고 성공 시에만 정리한다(`--keep`이면 성공해도 보존).
 - 회신이 오지 않으면 회신 파일과 worker 화면으로 원인을 확인해 보고한다. 지시 없이 재전송하거나 새 worker를 띄우지 않는다.
-- 완료 알림이 실패하면(예: host 재시작으로 socket 변경) worker는 회신 파일을 그대로 두고 실패 출력을 남긴다. 다른 경로로 재전송하지 않는다.
+- 완료 알림이 실패하면 worker는 회신 파일을 그대로 두고 실패 출력을 남긴다. 다른 경로로 재전송하지 않는다.
+- Claude host가 대기 중 재시작되면 같은 `collab.py wait`를 다시 background로 실행한다. 완료 표시가 이미 있으면 즉시 끝난다.
 - 사용자가 취소하면 전용 worker를 닫고 그 작업의 임시 파일을 정리한다. 기존 사용자 세션과 변경은 건드리지 않는다.
