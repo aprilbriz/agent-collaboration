@@ -353,7 +353,7 @@ class SpacePathDocumentedCommandsTest(TmpDir):
 
 class DocsConsistencyTest(unittest.TestCase):
     def test_relative_links_and_bin_references_exist(self):
-        docs = [ROOT / "README.md", ROOT / "RULES.md", *ROOT.glob("skills/*/SKILL.md"),
+        docs = [ROOT / "README.md", ROOT / "README.ko.md", ROOT / "RULES.md", *ROOT.glob("skills/*/SKILL.md"),
                 *ROOT.glob("templates/*.md")]
         for doc in docs:
             text = doc.read_text()
