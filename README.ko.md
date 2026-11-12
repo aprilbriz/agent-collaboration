@@ -18,7 +18,7 @@ Codex와 Claude Code 중 하나를 **host**(계획·검증), 다른 하나를 **
 | [skills/plan-with-me](skills/plan-with-me/SKILL.md) | 선택 UI로 계획 합의 |
 | [skills/collaboration-with-claude](skills/collaboration-with-claude/SKILL.md) | Codex host 진입 |
 | [skills/collaboration-with-codex](skills/collaboration-with-codex/SKILL.md) | Claude Code host 진입 |
-| `bin/collab-init` | 프로젝트에 RULES·skill 연결 |
+| `bin/collab-init` | 프로젝트 또는 전역에 RULES·skill 연결 |
 | `bin/collab-worker` | 전용 worker 생성·요청 전달·화면 확인·종료 |
 | `bin/claude-host` / `bin/notify-claude` | Claude host 실행·진단 / native inbox 알림 |
 
@@ -28,9 +28,27 @@ Codex와 Claude Code 중 하나를 **host**(계획·검증), 다른 하나를 **
 - `python3`, 사용할 환경의 `orca` 또는 `tmux`, 로그인·workspace trust를 마친 `codex`·`claude`가 필요합니다.
 - Linux는 미확인입니다. 네이티브 Windows는 지원하지 않습니다(`notify-claude`는 Unix socket 사용).
 
-## 1. 프로젝트에 적용
+## 1. 설치
 
-패키지를 원하는 위치에 두고 workspace마다 한 번 실행합니다. comm dir에 `RULES.md`가 없으면 host skill이 적용 여부를 묻고 승인받아 실행할 수도 있습니다. 패키지를 옮기면 symlink를 다시 적용합니다.
+전역 설치와 workspace별 적용 중 하나를 고릅니다. 둘 다 패키지를 원하는 위치에 두고 symlink로 연결하므로, 패키지를 옮기면 다시 적용합니다.
+
+### 전역 설치 (여러 프로젝트에서 사용)
+
+```bash
+PKG="/path/to/agent-collaboration"
+"$PKG/bin/collab-init" --global --dry-run
+"$PKG/bin/collab-init" --global
+collab-init "<workspace 절대경로>" --comm-only   # 프로젝트마다 comm dir만 준비
+```
+
+- `~/.claude/skills/`·`~/.agents/skills/`에 skill을, `~/.local/bin/`에 `bin/` helper 4개를 연결합니다. 이후 모든 프로젝트의 Claude Code·Codex 세션에서 skill을 쓸 수 있습니다.
+- `~/.local/bin`이 PATH에 없으면 추가하라고 안내합니다. 기존 파일이 있으면 아무것도 바꾸지 않고 목록을 알립니다.
+- `--comm-only`는 skill을 연결하지 않고 `<comm dir>/RULES.md`와 git exclude만 만듭니다. comm dir에 `RULES.md`가 없으면 host skill이 승인을 받아 이 명령을 실행할 수도 있습니다.
+- 전역 skill이 있는데 workspace별 적용을 하면 같은 skill이 두 곳에 생기므로 경고합니다.
+
+### workspace별 적용
+
+workspace마다 한 번 실행합니다.
 
 ```bash
 PKG="/path/to/agent-collaboration"

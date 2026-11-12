@@ -20,7 +20,7 @@ User agrees on a plan → request stating the baseline and commit owner → dedi
 | [skills/plan-with-me](skills/plan-with-me/SKILL.md) | Agree on a plan through a selection UI |
 | [skills/collaboration-with-claude](skills/collaboration-with-claude/SKILL.md) | Entry point for a Codex host |
 | [skills/collaboration-with-codex](skills/collaboration-with-codex/SKILL.md) | Entry point for a Claude Code host |
-| `bin/collab-init` | Link RULES and skills into a project |
+| `bin/collab-init` | Link RULES and skills into a project or globally |
 | `bin/collab-worker` | Start a worker, deliver requests, inspect its screen, close it |
 | `bin/claude-host` / `bin/notify-claude` | Launch and diagnose the Claude host / native inbox notification |
 
@@ -30,9 +30,27 @@ User agrees on a plan → request stating the baseline and commit owner → dedi
 - You need `python3`, `orca` or `tmux` for the environment you use, and `codex` and `claude` with login and workspace trust completed.
 - Linux is unverified. Native Windows is not supported (`notify-claude` uses a Unix socket).
 
-## 1. Apply to a project
+## 1. Install
 
-Put the package anywhere and run this once per workspace. If the comm dir has no `RULES.md`, the host skill can also ask for approval and run it. If you move the package, apply the symlinks again.
+Choose either a global install or per-workspace setup. Both put the package anywhere and connect it with symlinks, so apply again if you move the package.
+
+### Global install (use across projects)
+
+```bash
+PKG="/path/to/agent-collaboration"
+"$PKG/bin/collab-init" --global --dry-run
+"$PKG/bin/collab-init" --global
+collab-init "<absolute workspace path>" --comm-only   # prepare only the comm dir per project
+```
+
+- Links the skills into `~/.claude/skills/` and `~/.agents/skills/`, and the four `bin/` helpers into `~/.local/bin/`. After that, the skills are available in Claude Code and Codex sessions in every project.
+- If `~/.local/bin` is not on PATH, it tells you to add it. If files already exist there, it changes nothing and lists them.
+- `--comm-only` links no skills and creates only `<comm dir>/RULES.md` and the git exclude entry. If the comm dir has no `RULES.md`, the host skill can also ask for approval and run this command.
+- Running per-workspace setup while global skills exist puts the same skills in two places, so it warns you.
+
+### Per-workspace setup
+
+Run this once per workspace.
 
 ```bash
 PKG="/path/to/agent-collaboration"

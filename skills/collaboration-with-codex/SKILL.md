@@ -25,7 +25,7 @@ description: Claude Code host가 승인된 작업을 전용 Codex worker에게 �
      사용자는 출력된 명령을 먼저 복사하고 **기존 세션을 `/exit`로 종료한 뒤 셸에 붙여 넣어 실행**한다.
      기존 세션이 열린 채로 실행하면 같은 대화를 두 프로세스가 열게 된다. print 모드(`claude -p`)로 만든 대화는 이 재시작 절차로 이어받을 수 없다.
    host가 스스로 재시작하거나 settings 파일을 고치지 않는다. 재시작하면 새 socket을 요청서에 사용한다.
-3. comm dir에 이 패키지의 `RULES.md`가 없으면 `"<pkg>/bin/collab-init" "<workspace>" --comm-dir "<comm dir>"` 적용 여부를 사용자에게 선택 UI로 묻고, 승인하면 host가 실행한다.
+3. comm dir에 이 패키지의 `RULES.md`가 없으면 `"<pkg>/bin/collab-init" "<workspace>" --comm-dir "<comm dir>" --comm-only` 적용 여부를 사용자에게 선택 UI로 묻고, 승인하면 host가 실행한다.
 4. 요청 전 baseline(기준 코드·기존 변경, 명령·cwd·결과·기존 실패와 처리 방침)을 확인하거나 같은 조건의 유효한 결과를 승계한다.
    `templates/request.md`로 `01-claude-request.md`를 작성한다. 경로·git/테스트 cwd·commit 주체와 근거를 명시한다.
    worker가 기존 실패 수정 / 요구와 승인 범위 충돌 / 보안·회귀 가드 성격 테스트 삭제·약화 전에 멈춰 질문하도록 적는다.

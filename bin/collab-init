@@ -1,20 +1,32 @@
 #!/bin/sh
-# 대상 workspace에 협업 패키지를 연결한다.
-#   collab-init "<workspace 절대경로>" [--comm-dir "<절대경로>"] [--dry-run]
+# 협업 패키지를 workspace 또는 사용자 전역에 연결한다.
+#   collab-init "<workspace 절대경로>" [--comm-dir "<절대경로>"] [--comm-only] [--dry-run]
+#   collab-init --global [--dry-run]
+# workspace 적용:
 # - <comm dir>/RULES.md              -> 패키지 RULES.md (symlink)
 # - <workspace>/.agents/skills/...   -> plan-with-me, collaboration-with-claude (Codex host용)
 # - <workspace>/.claude/skills/...   -> plan-with-me, collaboration-with-codex (Claude host용)
 # - 만든 경로를 해당 git 저장소의 .git/info/exclude에 추가(추적 파일은 바꾸지 않음)
+# - --comm-only: skill은 연결하지 않고 comm dir의 RULES.md만 연결(전역 설치 뒤 새 프로젝트용)
+# 전역 적용(--global):
+# - ~/.agents/skills/·~/.claude/skills/에 위 skill, ~/.local/bin/에 bin/ helper를 symlink
 # 연결할 자리에 다른 파일·폴더가 이미 있으면 아무것도 바꾸지 않고 목록을 알린 뒤 종료 코드 1로 끝낸다.
 set -eu
 
-PKG=$(cd "$(dirname "$0")/.." && pwd -P)
+# ~/.local/bin의 symlink로 실행돼도 패키지 위치를 찾도록 링크를 따라간다.
+SELF=$0
+while [ -L "$SELF" ]; do
+  target=$(readlink "$SELF")
+  case "$target" in /*) SELF=$target ;; *) SELF=$(dirname "$SELF")/$target ;; esac
+done
+PKG=$(cd "$(dirname "$SELF")/.." && pwd -P)
 usage_error() {
   echo "collab-init: $1" >&2
-  echo '사용법: collab-init "<workspace>" [--comm-dir "<dir>"] [--dry-run]' >&2
+  echo '사용법: collab-init "<workspace>" [--comm-dir "<dir>"] [--comm-only] [--dry-run]' >&2
+  echo '        collab-init --global [--dry-run]' >&2
   exit 2
 }
-WS=""; WS_SET=0; COMM=""; DRY=0
+WS=""; WS_SET=0; COMM=""; DRY=0; GLOBAL=0; COMM_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --comm-dir)
@@ -22,25 +34,42 @@ while [ $# -gt 0 ]; do
       [ -n "$2" ] || usage_error '--comm-dir 값이 비어 있습니다'
       case "$2" in -*) usage_error "--comm-dir 다음에 옵션이 왔습니다: $2" ;; esac
       COMM=$2; shift 2 ;;
+    --comm-only) COMM_ONLY=1; shift ;;
+    --global) GLOBAL=1; shift ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) usage_error "알 수 없는 옵션입니다: $1" ;;
     *) [ $WS_SET = 0 ] || usage_error "인자가 너무 많습니다: $1"; WS=$1; WS_SET=1; shift ;;
   esac
 done
-[ -n "$WS" ] || usage_error 'workspace가 없습니다'
-case "$WS" in /*) ;; *) usage_error "workspace는 절대경로여야 합니다: $WS" ;; esac
-[ -d "$WS" ] || usage_error "workspace가 없습니다: $WS"
-WS=$(cd "$WS" && pwd -P)
-[ -n "$COMM" ] || COMM="$WS/.comm"
-case "$COMM" in /*) ;; *) usage_error "comm dir은 절대경로여야 합니다: $COMM" ;; esac
 
-# "원본|링크" 목록. 모두 함께 연결되어야 host skill이 가리키는 RULES.md·helper가 맞는다.
-LINKS="$PKG/RULES.md|$COMM/RULES.md
-$PKG/skills/plan-with-me|$WS/.agents/skills/plan-with-me
-$PKG/skills/collaboration-with-claude|$WS/.agents/skills/collaboration-with-claude
-$PKG/skills/plan-with-me|$WS/.claude/skills/plan-with-me
-$PKG/skills/collaboration-with-codex|$WS/.claude/skills/collaboration-with-codex"
+SKILL_LINKS() {  # $1 = .agents·.claude가 놓일 상위 경로
+  printf '%s\n' "$PKG/skills/plan-with-me|$1/.agents/skills/plan-with-me" \
+    "$PKG/skills/collaboration-with-claude|$1/.agents/skills/collaboration-with-claude" \
+    "$PKG/skills/plan-with-me|$1/.claude/skills/plan-with-me" \
+    "$PKG/skills/collaboration-with-codex|$1/.claude/skills/collaboration-with-codex"
+}
+
+if [ $GLOBAL = 1 ]; then
+  [ $WS_SET = 0 ] || usage_error "--global은 workspace를 받지 않습니다: $WS"
+  [ -z "$COMM" ] || usage_error '--global은 --comm-dir와 함께 쓸 수 없습니다'
+  [ $COMM_ONLY = 0 ] || usage_error '--global은 --comm-only와 함께 쓸 수 없습니다'
+  case "${HOME:-}" in /*) ;; *) usage_error 'HOME이 절대경로가 아닙니다' ;; esac
+  BIN_DIR="$HOME/.local/bin"
+  LINKS=$(SKILL_LINKS "$HOME"; for helper in collab-init collab-worker claude-host notify-claude; do
+    echo "$PKG/bin/$helper|$BIN_DIR/$helper"; done)
+else
+  [ -n "$WS" ] || usage_error 'workspace가 없습니다'
+  case "$WS" in /*) ;; *) usage_error "workspace는 절대경로여야 합니다: $WS" ;; esac
+  [ -d "$WS" ] || usage_error "workspace가 없습니다: $WS"
+  WS=$(cd "$WS" && pwd -P)
+  [ -n "$COMM" ] || COMM="$WS/.comm"
+  case "$COMM" in /*) ;; *) usage_error "comm dir은 절대경로여야 합니다: $COMM" ;; esac
+  # "원본|링크" 목록. 모두 함께 연결되어야 host skill이 가리키는 RULES.md·helper가 맞는다.
+  LINKS="$PKG/RULES.md|$COMM/RULES.md"
+  [ $COMM_ONLY = 1 ] || LINKS="$LINKS
+$(SKILL_LINKS "$WS")"
+fi
 
 conflicts=$(printf '%s\n' "$LINKS" | while IFS='|' read -r src dst; do
   # ENOTDIR도 최종 경로의 -e 검사에서는 '없음'처럼 보이므로 부모부터 확인한다.
@@ -77,6 +106,24 @@ exclude() {  # $1 = 만든 경로(절대)
     mkdir -p "$(dirname "$ex")"; printf '/%s\n' "$rel" >> "$ex"; echo "exclude: /$rel ($ex)"; fi
 }
 
+if [ $GLOBAL = 1 ]; then
+  printf '%s\n' "$LINKS" | while IFS='|' read -r src dst; do
+    if [ -L "$dst" ]; then echo "유지: $dst"; else
+      do_run mkdir -p "$(dirname "$dst")"
+      do_run ln -s "$src" "$dst"
+      [ $DRY = 1 ] || echo "연결: $dst -> $src"
+    fi
+  done
+  case ":${PATH:-}:" in *":$BIN_DIR:"*) ;; *)
+    echo "주의: ${BIN_DIR}가 PATH에 없습니다. 셸 설정에 export PATH=\"$BIN_DIR:\$PATH\"를 추가하세요." ;; esac
+  echo "완료: 전역 skill(~/.claude/skills, ~/.agents/skills)·helper($BIN_DIR)"
+  echo "프로젝트에는 collab-init \"<workspace>\" --comm-only로 comm dir만 준비하면 됩니다."
+  exit 0
+fi
+
+if [ $COMM_ONLY = 0 ] && [ -L "${HOME:-}/.claude/skills/collaboration-with-codex" ]; then
+  echo "주의: 전역 skill이 이미 연결돼 있어 workspace skill 연결은 중복입니다. --comm-only를 고려하세요." >&2
+fi
 do_run mkdir -p "$COMM"
 printf '%s\n' "$LINKS" | while IFS='|' read -r src dst; do
   if [ -L "$dst" ]; then echo "유지: $dst"; else
