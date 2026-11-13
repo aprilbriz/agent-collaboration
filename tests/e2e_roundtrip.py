@@ -364,7 +364,11 @@ def main():
         run(["git", "-C", ROOT, "worktree", "add", "-q", "-b", e2e_branch, ws, "HEAD"])
     else:
         ws.mkdir(parents=True)
-    thread = ws / ".comm" / "20261110-e2e"
+    # 실제 흐름처럼 helper로 thread를 만들어 규칙 사본(<thread>/rules/)을 쓰게 한다.
+    # 증거 폴더(실행 기록)가 생기기 전 단계라 run() 대신 직접 실행한다.
+    made = subprocess.run([str(c) for c in [*COLLAB, "thread", "--workspace", ws, "--topic", "e2e"]],
+                          capture_output=True, text=True, check=True)
+    thread = Path(json.loads(made.stdout)["thread"])
     evidence = ws / ".comm" / "e2e-evidence" if a.parallel else thread / "02-evidence"
     evidence.mkdir(parents=True)
     RUN_LOG = evidence / "runner.log"
@@ -389,7 +393,8 @@ def main():
                 tid = next(json.loads(l)["thread_id"] for l in out.splitlines()
                            if l.startswith("{") and json.loads(l).get("type") == "thread.started")
                 log(f"codex host thread: {tid}")
-                host = Term(a.env, f"e2e-host-{run_id}", ws, shlex.join(["codex", "resume", tid]), terms)
+                host = Term(a.env, f"e2e-host-{run_id}", ws, shlex.join(
+                    ["codex", "-c", "check_for_update_on_startup=false", "resume", tid]), terms)
                 time.sleep(15)
                 header_for = lambda r: f"Codex thread: {tid}"
                 notify_for = lambda r: shlex.join(["codex", "queue", "--thread", tid,

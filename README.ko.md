@@ -63,7 +63,8 @@ worktree에는 원래 작업 트리의 commit하지 않은 변경과 무시된 �
 - `python3`가 있어야 합니다. helper는 표준 라이브러리만 씁니다.
 - worker 환경에 맞춰 `orca` 또는 `tmux`가 필요합니다.
 - `codex`와 `claude` 모두 로그인과 workspace trust를 마쳐 두어야 합니다.
-- 전용 worker는 권한 우회 flag로 실행됩니다(Claude `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox`).
+- 전용 worker는 권한 우회 flag로 실행됩니다(Claude `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox`). Codex worker에는 업데이트 안내 창에 막히지 않도록 그 실행에만 `-c check_for_update_on_startup=false`도 붙입니다.
+- worker CLI에서 대상 저장소를 미리 신뢰해 두어야 합니다. 한 번도 신뢰하지 않은 폴더에서 시작한 worker는 신뢰 확인 창에서 멈춥니다. 신뢰한 저장소의 worktree는 그대로 신뢰됩니다.
 - Linux는 확인하지 않았습니다. 네이티브 Windows는 지원하지 않습니다.
 
 ## 개발

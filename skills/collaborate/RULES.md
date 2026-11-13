@@ -63,7 +63,8 @@ plugin이 업데이트되어도 진행 중인 thread는 처음 복사한 규칙�
   기록·실행 인스턴스가 다르거나 host 자기 terminal이면 멈춘다. Orca 탭 제목은 식별에 쓰지 않고 tmux close는 worker pane만 닫는다.
 - worker에게 보내는 입력은 `<요청서 절대경로> — <thread의 RULES.md 사본 절대경로> 준수` 한 줄뿐이다.
 - 전용 worker에는 권한 우회를 기본 적용한다: Claude Code `--dangerously-skip-permissions`,
-  Codex `--dangerously-bypass-approvals-and-sandbox`. host의 권한·model·전역 설정은 바꾸지 않는다.
+  Codex `--dangerously-bypass-approvals-and-sandbox`. Codex worker에는 시작 시 업데이트 선택창이 뜨지 않도록
+  `-c check_for_update_on_startup=false`도 붙인다(그 실행에만 적용). host의 권한·model·전역 설정은 바꾸지 않는다.
   그 밖의 worker 인자는 사용자가 지정했을 때만 붙인다.
 - 요청서 상태 헤더 바로 뒤에 다음 문장을 둔다:
   "작업의 성격과 복잡도에 따라 필요한 경우, 적절한 모델과 추론 수준의 서브 에이전트를
