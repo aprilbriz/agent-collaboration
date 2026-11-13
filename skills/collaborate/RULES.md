@@ -6,8 +6,9 @@ host와 worker는 협업 작업을 시작하기 전에 이 파일을 읽는다.
 이 파일은 협업 절차만 정한다. 코딩·테스트·Git·기록 방식 같은 개발 규칙은 workspace와 대상 저장소에
 이미 있는 `AGENTS.md`·`CLAUDE.md`와 그것이 지정한 문서를 따른다.
 
-이 파일은 `agent-collaboration` plugin의 `collaborate` skill 폴더(`<skill>`)에 있다. host만 plugin을 설치하며,
-worker는 요청 한 줄에 적힌 이 파일의 절대경로를 읽는다. 아래 `scripts/`·`templates/` 경로는 `<skill>` 기준이다.
+이 파일의 원본은 `agent-collaboration` plugin의 `collaborate` skill 폴더(`<skill>`)에 있다. host만 plugin을 설치한다.
+`collab.py thread`가 thread를 만들 때 이 파일과 `templates/`를 `<thread>/rules/`에 복사하고, worker는 요청 한 줄에 적힌 그 사본을 읽는다.
+plugin이 업데이트되어도 진행 중인 thread는 처음 복사한 규칙을 따른다. 아래 `scripts/` 경로는 `<skill>` 기준이다.
 
 ## 0. 사용자 결정
 
@@ -60,7 +61,7 @@ worker는 요청 한 줄에 적힌 이 파일의 절대경로를 읽는다. 아�
 - worker terminal 생성·요청 전달·화면 확인·대기·종료는 `python3 <skill>/scripts/collab.py`(`--env orca|tmux`)로 하며, helper가 만든 terminal만 다룬다.
   start가 thread의 `worker-record.json`에 소유·실행 정보를 남긴다. send는 요청서의 thread, read·close는 `--thread`로 기록과 대조한다.
   기록·실행 인스턴스가 다르거나 host 자기 terminal이면 멈춘다. Orca 탭 제목은 식별에 쓰지 않고 tmux close는 worker pane만 닫는다.
-- worker에게 보내는 입력은 `<요청서 절대경로> — <이 RULES.md 절대경로> 준수` 한 줄뿐이다.
+- worker에게 보내는 입력은 `<요청서 절대경로> — <thread의 RULES.md 사본 절대경로> 준수` 한 줄뿐이다.
 - 전용 worker에는 권한 우회를 기본 적용한다: Claude Code `--dangerously-skip-permissions`,
   Codex `--dangerously-bypass-approvals-and-sandbox`. host의 권한·model·전역 설정은 바꾸지 않는다.
   그 밖의 worker 인자는 사용자가 지정했을 때만 붙인다.
@@ -78,6 +79,8 @@ worker는 요청 한 줄에 적힌 이 파일의 절대경로를 읽는다. 아�
   | Codex | `Codex thread: <CODEX_THREAD_ID>` | `codex queue --thread "<id>" --message "Claude 회신 완료: <회신 절대경로>"` | 턴을 마치고 queue 메시지로 재개 |
   | Claude Code | `Completion marker: <회신 절대경로>.done` | `touch "<회신 절대경로>.done"` | `collab.py wait`를 background로 실행, 끝나면 재개 |
 
+- `collab.py start`·`send` 출력의 `next_step`은 요청서 헤더로 만든 다음 대기 방법이다. Claude host는 `next_step.command`를 그대로 background로 실행한다.
+  헤더가 없거나 잘못되어 `warning`이 나오면 알림을 받을 수 없으므로 요청서를 고친 뒤 진행한다.
 - Claude host의 `collab.py wait`는 완료 표시가 생기면 0, worker terminal을 연속으로 확인할 수 없으면 3, 지정 시간 초과면 4로 끝난다.
   0이 아니면 회신 파일과 worker 화면으로 원인을 확인해 보고한다.
 - 알림 명령의 성공은 **전송 접수**일 뿐이다. 완료 여부는 host가 회신 파일과 실제 변경으로 확인한다.

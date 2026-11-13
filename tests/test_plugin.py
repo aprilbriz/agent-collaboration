@@ -112,6 +112,65 @@ class RequestLineTest(unittest.TestCase):
         self.assertEqual(command[:3], ["python3", str(SCRIPT), "mark-closed"])
 
 
+class RulesSnapshotTest(unittest.TestCase):
+    """plugin 업데이트로 cache 경로가 바뀌어도 진행 중인 thread가 같은 규칙을 가리키는지 확인한다."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="collab rules-")
+        self.ws = Path(self.directory.name).resolve()
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_thread_copies_rules_and_templates_and_request_line_uses_the_copy(self):
+        data = json.loads(run_collab("thread", "--workspace", self.ws, "--topic", "snap").stdout)
+        thread = Path(data["thread"])
+        copy = thread / "rules"
+        self.assertEqual((copy / "RULES.md").read_bytes(), (SKILL / "RULES.md").read_bytes())
+        self.assertEqual(sorted(p.name for p in (copy / "templates").iterdir()),
+                         sorted(p.name for p in (SKILL / "templates").iterdir()))
+        for target in re.findall(r"\]\(([^)#]+)\)", (copy / "RULES.md").read_text()):
+            self.assertTrue((copy / target).exists(), target)  # 사본 안의 상대 링크도 유효하다
+        request = thread / "01-claude-request.md"
+        self.assertEqual(collab.request_line(str(request)), f"{request} — {copy / 'RULES.md'} 준수")
+
+    def test_existing_thread_keeps_its_original_copy(self):
+        first = json.loads(run_collab("thread", "--workspace", self.ws, "--topic", "keep").stdout)
+        rules = Path(first["rules"])
+        rules.write_text("older rules\n")
+        again = run_collab("thread", "--workspace", self.ws, "--topic", "keep", "--existing")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(again.stdout)["rules_snapshot"], "kept")
+        self.assertEqual(rules.read_text(), "older rules\n")
+
+
+class NextStepTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="collab next-")
+        self.thread = Path(self.directory.name).resolve()
+        self.request = self.thread / "01-claude-request.md"
+        self.reply = self.thread / "02-codex-implementation.md"
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_claude_header_yields_the_exact_background_wait_command(self):
+        self.request.write_text(f"Status: OPEN\nCompletion marker: {self.reply}.done\n")
+        step = collab.next_step(str(self.request))
+        self.assertTrue(step["run_in_background"])
+        command = shlex.split(step["command"])
+        self.assertEqual(command, ["python3", str(SCRIPT), "wait", "--thread", str(self.thread),
+                                   "--reply", str(self.reply)])
+
+    def test_codex_header_missing_header_and_foreign_marker(self):
+        self.request.write_text("Codex thread: abc-123\n")
+        self.assertEqual(collab.next_step(str(self.request))["host"], "codex")
+        self.request.write_text("Status: OPEN\n")
+        self.assertIn("warning", collab.next_step(str(self.request)))
+        self.request.write_text("Completion marker: /elsewhere/02-codex-implementation.md.done\n")
+        self.assertIn("warning", collab.next_step(str(self.request)))
+
+
 class ThreadTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="collab thread-")
@@ -130,8 +189,9 @@ class ThreadTest(unittest.TestCase):
         self.assertTrue(thread.is_dir())
         self.assertEqual(thread.parent, self.ws / ".comm")
         self.assertRegex(thread.name, r"^\d{8}-fix-login-bug$")
-        self.assertEqual(data["rules"], str(SKILL / "RULES.md"))
-        self.assertEqual(data["templates"], str(SKILL / "templates"))
+        self.assertEqual(data["rules"], str(thread / "rules/RULES.md"))
+        self.assertEqual(data["templates"], str(thread / "rules/templates"))
+        self.assertEqual(data["rules_snapshot"], "created")
         exclude = self.ws / ".git/info/exclude"
         self.assertEqual(exclude.read_text().count("/.comm\n"), 1)
         self.assertEqual(subprocess.run(["git", "-C", str(self.ws), "status", "--porcelain"],

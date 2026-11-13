@@ -280,6 +280,19 @@ def check_round(ws, reply, result_name, content, host, wterm, timeout):
     return 0 if result_ok else 1
 
 
+def check_next_step(host, started, thread, reply):
+    """start 출력의 next_step이 host가 실행할 정확한 대기 방법인지 확인한다."""
+    step = started.get("next_step") or {}
+    if host == "claude":
+        expected = shlex.join(["python3", str(COLLAB[1]), "wait", "--thread", str(thread), "--reply", str(reply)])
+        ok = step.get("command") == expected and step.get("run_in_background") is True
+    else:
+        ok = step.get("host") == "codex" and "warning" not in step
+    log(f"next_step: {json.dumps(step, ensure_ascii=False)[:300]} -> {'일치' if ok else '불일치'}")
+    if not ok:
+        raise RuntimeError("start 출력의 next_step이 기대와 다릅니다")
+
+
 def run_parallel(a, ws, worker, terms, start_host):
     """같은 트리 작업과 worktree 작업을 동시에 진행하고, 합치기까지 확인한다."""
     base = run(["git", "-C", ws, "symbolic-ref", "--short", "HEAD"]).strip()
@@ -299,6 +312,7 @@ def run_parallel(a, ws, worker, terms, start_host):
     for t in tasks:
         started = json.loads(run([*COLLAB, "start", "--env", a.env, "--worker", worker, "--workspace", t["ws"],
                                   "--request", t["req"], "--title", f"e2e-{t['thread'].name}"]))
+        check_next_step(a.host, started, t["thread"], t["reply"])
         t["term"] = Term.worker(a.env, started["handle"], t["thread"])
         terms.append(t["term"])
         log(f"worker 시작: {t['term'].handle} ({t['ws']})")
@@ -396,6 +410,7 @@ def main():
             write_request(req, reply, worker, header_for(reply), notify_for(reply), ws, "e2e-result.txt", "ok")
             started = json.loads(run([*COLLAB, "start", "--env", a.env, "--worker", worker,
                                       "--workspace", ws, "--request", req, "--title", f"e2e-worker-{run_id}"]))
+            check_next_step(a.host, started, thread, reply)
             wterm = Term.worker(a.env, started["handle"], thread)
             terms.append(wterm)
             log(f"worker 시작: {wterm.handle} send={json.dumps(started.get('send_result'), ensure_ascii=False)[:300]}")

@@ -40,7 +40,7 @@ In the host session, describe the work and ask for collaboration, for example "u
 - **Thread:** the host creates `<workspace>/.comm/<date>-<topic>/`. The folder is added only to that git repository's `.git/info/exclude`; tracked files are not changed.
 - **Worker:** the host starts the other CLI in an Orca tab or a `collab-` tmux session and sends one request line. On tmux, you can watch the worker with the `tmux attach` command the host gives you.
 - **Completion notice:**
-  - **Claude Code host:** the host leaves a background completion wait running. When the worker finishes its reply and creates the completion marker file (`<reply>.done`), the host continues automatically. No inbound setting or separate launcher is needed.
+  - **Claude Code host:** the host leaves a background completion wait running. When the worker finishes its reply and creates the completion marker file (`<reply>.done`), the host continues automatically. No inbound setting or separate launcher is needed. If the host forgot to start the wait, say "start the wait again"; if the reply is already done, it continues immediately.
   - **Codex host:** the worker notifies the host thread with `codex queue`.
 - **Verify and wrap up:** the host independently verifies the reply and the actual changes. If something is wrong, it asks the same worker for a fix. After PASS, it wraps up according to the commit owner in the request, then closes the worker terminal.
 
@@ -57,7 +57,7 @@ The host proposes a workspace for each task during planning, and you approve it.
 
 A worktree does not contain uncommitted changes from the original working tree or ignored files (such as `node_modules`). The host puts any setup commands the worker needs in the request.
 
-The canonical procedure is [skills/collaborate/RULES.md](skills/collaborate/RULES.md), and the request and reply forms are in [skills/collaborate/templates/](skills/collaborate/templates/). The worker reads the absolute `RULES.md` path given in its request line.
+The canonical procedure is [skills/collaborate/RULES.md](skills/collaborate/RULES.md), and the request and reply forms are in [skills/collaborate/templates/](skills/collaborate/templates/). When a thread is created, both are copied into `<thread>/rules/`, and the worker reads the copy named in its request line. Updating the plugin mid-task therefore does not change the rules for work already in progress.
 
 ## Requirements
 

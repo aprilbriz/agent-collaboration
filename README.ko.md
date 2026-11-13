@@ -38,7 +38,7 @@ host 세션에서 하고 싶은 일을 말하고 협업을 요청합니다. 예:
 - **thread:** host가 `<workspace>/.comm/<날짜>-<주제>/`를 만듭니다. 이 폴더는 그 git 저장소의 `.git/info/exclude`에만 추가하고, 추적 파일은 바꾸지 않습니다.
 - **worker 실행:** host가 Orca 탭 또는 `collab-` tmux session에 상대 CLI를 띄우고 요청 한 줄을 보냅니다. tmux라면 host가 알려 주는 `tmux attach` 명령으로 worker 화면을 볼 수 있습니다.
 - **완료 알림:**
-  - **Claude Code host:** host가 완료 대기를 background로 걸어 두고, worker가 회신 뒤 완료 표시 파일(`<회신>.done`)을 만들면 자동으로 이어갑니다. 수신 설정이나 별도 launcher는 필요 없습니다.
+  - **Claude Code host:** host가 완료 대기를 background로 걸어 두고, worker가 회신 뒤 완료 표시 파일(`<회신>.done`)을 만들면 자동으로 이어갑니다. 수신 설정이나 별도 launcher는 필요 없습니다. host가 대기를 빠뜨렸다면 "wait 다시 걸어"라고 말하면 됩니다. 이미 끝난 회신이면 바로 이어갑니다.
   - **Codex host:** worker가 `codex queue`로 host thread에 알립니다.
 - **검증·마무리:** host가 회신과 실제 변경을 독립 검증합니다. 문제가 있으면 같은 worker에 수정을 요청하고, PASS 뒤에는 요청서의 commit 주체에 따라 마무리합니다. 마지막에 worker terminal을 닫습니다.
 
@@ -55,7 +55,7 @@ host 세션에서 하고 싶은 일을 말하고 협업을 요청합니다. 예:
 
 worktree에는 원래 작업 트리의 commit하지 않은 변경과 무시된 파일(`node_modules` 등)이 없습니다. 필요한 준비 명령은 host가 요청서에 적습니다.
 
-절차 정본은 [skills/collaborate/RULES.md](skills/collaborate/RULES.md)이고, 요청·회신 양식은 [skills/collaborate/templates/](skills/collaborate/templates/)에 있습니다. worker는 요청 한 줄에 적힌 `RULES.md` 절대경로를 읽습니다.
+절차 정본은 [skills/collaborate/RULES.md](skills/collaborate/RULES.md)이고, 요청·회신 양식은 [skills/collaborate/templates/](skills/collaborate/templates/)에 있습니다. thread를 만들 때 이 둘을 `<thread>/rules/`에 복사하고, worker는 요청 한 줄에 적힌 그 사본을 읽습니다. 그래서 작업 중에 plugin을 업데이트해도 진행 중인 작업은 처음 규칙대로 끝납니다.
 
 ## 실행 전제
 

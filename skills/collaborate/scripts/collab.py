@@ -2,7 +2,7 @@
 """협업 thread를 만들고 전용 worker를 시작·대조·대기·종료한다(collaborate skill helper).
 
 host agent가 `python3 <skill>/scripts/collab.py <command>`로 실행한다. 사용자가 직접 실행할 필요는 없다.
-worker 입력은 항상 "<요청서 절대경로> — <RULES.md 절대경로> 준수" 한 줄이다.
+worker 입력은 항상 "<요청서 절대경로> — <thread의 RULES.md 사본 절대경로> 준수" 한 줄이다.
 전송 접수·turn 시작 관찰은 완료 판정이 아니다. helper는 자동 재전송·종료하지 않는다.
 """
 import argparse
@@ -26,6 +26,7 @@ TMUX_PREFIX = "collab-"
 DONE_SUFFIX = ".done"
 RECORD_NAME = "worker-record.json"
 WORKTREE_NAME = "worktree.json"
+RULES_SNAPSHOT = "rules"  # <thread>/rules/: thread를 만들 때 복사한 RULES.md와 templates
 BRANCH_PREFIX = "collab/"
 HISTORY_DIR = "worker-record-history"
 WORKER_DEFAULT_ARGS = {
@@ -45,8 +46,45 @@ def fail(message, code=2, data=None):
     raise WorkerError(message, code, data)
 
 
+def thread_rules(thread):
+    """thread의 규칙 사본. plugin이 업데이트되어 cache 경로가 바뀌어도 진행 중인 작업은 이 사본을 따른다."""
+    copy = Path(thread) / RULES_SNAPSHOT / RULES.name
+    return copy if copy.is_file() else RULES
+
+
+def snapshot_rules(thread):
+    target = Path(thread) / RULES_SNAPSHOT
+    if target.exists():
+        return "kept"
+    temp = Path(thread) / f".{RULES_SNAPSHOT}.tmp"
+    shutil.rmtree(temp, ignore_errors=True)
+    temp.mkdir()
+    shutil.copy2(RULES, temp / RULES.name)
+    shutil.copytree(TEMPLATES, temp / TEMPLATES.name)
+    os.replace(temp, target)
+    return "created"
+
+
 def request_line(request):
-    return f"{request} — {RULES} 준수"
+    return f"{request} — {thread_rules(Path(request).parent)} 준수"
+
+
+def next_step(request):
+    """요청서 헤더로 host가 다음에 할 일을 알려 준다. Claude host는 이 wait 명령을 background로 실행한다."""
+    thread = Path(request).parent
+    text = Path(request).read_text(errors="replace")
+    marker = re.search(r"^Completion marker:\s*(.+?)\s*$", text, re.M)
+    if marker:
+        done = Path(marker.group(1).strip().strip('"'))
+        if not done.name.endswith(DONE_SUFFIX) or not done.is_absolute() or done.parent != thread:
+            return {"host": "claude", "warning": f"Completion marker가 이 thread의 '<회신>.done' 절대경로가 아닙니다: {done}"}
+        reply = done.with_name(done.name[:-len(DONE_SUFFIX)])
+        return {"host": "claude", "run_in_background": True,
+                "command": self_command("wait", "--thread", str(thread), "--reply", str(reply)),
+                "note": "Bash run_in_background로 실행하고 턴을 마칩니다. 명령이 끝나면 다시 호출됩니다"}
+    if re.search(r"^Codex thread:\s*\S+", text, re.M):
+        return {"host": "codex", "note": "턴을 마치고 'Claude 회신 완료: <경로>' queue 메시지를 기다립니다"}
+    return {"warning": "요청서 헤더에 Completion marker 또는 Codex thread가 없어 완료 알림을 받을 수 없습니다"}
 
 
 def self_command(*args):
@@ -416,7 +454,8 @@ def cmd_start(a):
                 verify_worker(thread, a.env, handle)
                 mark_sending(record)
             sent = send_orca(handle, line, a.dry_run)
-            result = {"env": a.env, "handle": handle, "sent": line, "send_result": sent}
+            result = {"env": a.env, "handle": handle, "sent": line, "send_result": sent,
+                      "next_step": next_step(request)}
         else:
             slug = lambda text: re.sub(r"[^A-Za-z0-9_-]+", "-", text).strip("-")[:24]
             name = "-".join(part for part in ["collab", slug(ws.name), slug(a.title), secrets.token_hex(3)] if part)
@@ -438,7 +477,7 @@ def cmd_start(a):
             tmux_type(handle, f"cd {shlex.quote(str(ws))} && exec {shlex.join([cli, *extra, line])}", a.dry_run)
             sent = None
             result = {"env": a.env, "handle": handle, "session": name, "sent": line,
-                      "attach": f"tmux attach -t {shlex.quote('=' + name)}"}
+                      "attach": f"tmux attach -t {shlex.quote('=' + name)}", "next_step": next_step(request)}
         if record:
             result["send_summary"] = update_sent(record, sent, line)
             result["record"] = str(record_path(thread))
@@ -502,7 +541,7 @@ def cmd_send(a):
         if not a.dry_run:
             summary = update_sent(record, sent, line)
             emit({"env": a.env, "handle": a.handle, "sent": line,
-                  "send_result": sent, "send_summary": summary})
+                  "send_result": sent, "send_summary": summary, "next_step": next_step(request)})
     except (WorkerError, OSError) as error:
         if not a.dry_run:
             record.update(status="failed", error=str(error))
@@ -672,8 +711,11 @@ def cmd_thread(a):
             if created:
                 thread.rmdir()
             raise
+    snapshot = snapshot_rules(thread)
+    rules = thread / RULES_SNAPSHOT
     result = {"thread": str(thread), "comm_dir": str(comm), "git_exclude": excluded,
-              "rules": str(RULES), "templates": str(TEMPLATES),
+              "rules": str(rules / RULES.name), "templates": str(rules / TEMPLATES.name),
+              "rules_snapshot": snapshot,
               "worker_workspace": worktree["workspace"] if worktree else str(ws)}
     if worktree:
         result["worktree"] = {key: worktree[key] for key in
