@@ -15,7 +15,7 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("collab_worker_records", str(ROOT / "bin/collab-worker"))
+loader = importlib.machinery.SourceFileLoader("collab_worker_records", str(ROOT / "skills/collaborate/scripts/collab.py"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 worker = importlib.util.module_from_spec(spec)
 loader.exec_module(worker)
@@ -35,7 +35,6 @@ class WorkerRecordsTest(unittest.TestCase):
         self.workspace = Path(self.temp.name).resolve()
         self.comm = self.workspace / ".comm"
         self.comm.mkdir()
-        (self.comm / "RULES.md").write_text("rules")
         self.thread = self.comm / "thread"
         self.thread.mkdir()
         self.request = self.thread / "01-host-request.md"

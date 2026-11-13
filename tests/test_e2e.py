@@ -59,6 +59,29 @@ class E2ECleanupTest(unittest.TestCase):
             self.assertIsNone(E2E.RUN_LOG)
 
 
+class E2EHostPromptTest(unittest.TestCase):
+    def test_prompt_does_not_contain_the_receipt_it_is_judged_by(self):
+        thread = Path("/ws/.comm/t")
+        replies = [thread / "02-codex-implementation.md", thread / "04-codex-implementation.md"]
+        for reply in replies:
+            prompt = E2E.claude_host_prompt(thread, reply)
+            self.assertIn(str(reply), prompt)
+            pattern = E2E.re.compile(r"HOST-RECEIVED\s+\S*" + E2E.re.escape(reply.name))
+            self.assertIsNone(pattern.search(E2E.re.sub(r"\s*\n\s*", "", prompt)))
+        self.assertLess(len(E2E.HOST_LAUNCH_PROMPT.encode()), 200)
+
+    def test_parallel_prompt_has_one_wait_per_task_and_no_receipt(self):
+        pairs = [(Path(f"/ws/.comm/{name}"), Path(f"/ws/.comm/{name}/02-codex-implementation.md"))
+                 for name in ("20261113-a", "20261113-b")]
+        prompt = E2E.claude_host_parallel_prompt(pairs)
+        self.assertEqual(prompt.count(" wait --thread "), 2)
+        flat = E2E.re.sub(r"\s*\n\s*", "", prompt)
+        for _, reply in pairs:
+            self.assertIn(str(reply), prompt)
+            pattern = E2E.re.compile(r"HOST-RECEIVED\s+\S*" + E2E.re.escape(f"{reply.parent.name}/{reply.name}"))
+            self.assertIsNone(pattern.search(flat))
+
+
 class E2ETermControlTest(unittest.TestCase):
     def test_recorded_worker_uses_thread_for_read_and_close(self):
         term = E2E.Term.worker("orca", "term-worker", Path("/tmp/thread"))
@@ -67,7 +90,7 @@ class E2ETermControlTest(unittest.TestCase):
             self.assertTrue(term.close())
         for call in run.call_args_list:
             command = call.args[0]
-            self.assertEqual(command[0], E2E.BIN / "collab-worker")
+            self.assertEqual(command[:2], E2E.COLLAB)
             self.assertEqual(command[command.index("--thread") + 1], Path("/tmp/thread"))
 
     def test_direct_host_uses_only_its_own_handle(self):

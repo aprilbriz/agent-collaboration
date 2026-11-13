@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""전용 worker를 시작하고 thread의 생성 기록과 실행 인스턴스를 대조해 통신한다.
+"""협업 thread를 만들고 전용 worker를 시작·대조·대기·종료한다(collaborate skill helper).
 
-입력은 항상 "<요청서 절대경로> — RULES.md 준수" 한 줄이다.
+host agent가 `python3 <skill>/scripts/collab.py <command>`로 실행한다. 사용자가 직접 실행할 필요는 없다.
+worker 입력은 항상 "<요청서 절대경로> — <thread의 RULES.md 사본 절대경로> 준수" 한 줄이다.
 전송 접수·turn 시작 관찰은 완료 판정이 아니다. helper는 자동 재전송·종료하지 않는다.
 """
 import argparse
@@ -18,8 +19,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+SKILL_DIR = Path(__file__).resolve().parent.parent
+RULES = SKILL_DIR / "RULES.md"
+TEMPLATES = SKILL_DIR / "templates"
 TMUX_PREFIX = "collab-"
+DONE_SUFFIX = ".done"
 RECORD_NAME = "worker-record.json"
+WORKTREE_NAME = "worktree.json"
+RULES_SNAPSHOT = "rules"  # <thread>/rules/: thread를 만들 때 복사한 RULES.md와 templates
+BRANCH_PREFIX = "collab/"
 HISTORY_DIR = "worker-record-history"
 WORKER_DEFAULT_ARGS = {
     "claude": ["--dangerously-skip-permissions"],
@@ -38,14 +46,55 @@ def fail(message, code=2, data=None):
     raise WorkerError(message, code, data)
 
 
+def thread_rules(thread):
+    """thread의 규칙 사본. plugin이 업데이트되어 cache 경로가 바뀌어도 진행 중인 작업은 이 사본을 따른다."""
+    copy = Path(thread) / RULES_SNAPSHOT / RULES.name
+    return copy if copy.is_file() else RULES
+
+
+def snapshot_rules(thread):
+    target = Path(thread) / RULES_SNAPSHOT
+    if target.exists():
+        return "kept"
+    temp = Path(thread) / f".{RULES_SNAPSHOT}.tmp"
+    shutil.rmtree(temp, ignore_errors=True)
+    temp.mkdir()
+    shutil.copy2(RULES, temp / RULES.name)
+    shutil.copytree(TEMPLATES, temp / TEMPLATES.name)
+    os.replace(temp, target)
+    return "created"
+
+
 def request_line(request):
-    return f"{request} — RULES.md 준수"
+    return f"{request} — {thread_rules(Path(request).parent)} 준수"
+
+
+def next_step(request):
+    """요청서 헤더로 host가 다음에 할 일을 알려 준다. Claude host는 이 wait 명령을 background로 실행한다."""
+    thread = Path(request).parent
+    text = Path(request).read_text(errors="replace")
+    marker = re.search(r"^Completion marker:\s*(.+?)\s*$", text, re.M)
+    if marker:
+        done = Path(marker.group(1).strip().strip('"'))
+        if not done.name.endswith(DONE_SUFFIX) or not done.is_absolute() or done.parent != thread:
+            return {"host": "claude", "warning": f"Completion marker가 이 thread의 '<회신>.done' 절대경로가 아닙니다: {done}"}
+        reply = done.with_name(done.name[:-len(DONE_SUFFIX)])
+        return {"host": "claude", "run_in_background": True,
+                "command": self_command("wait", "--thread", str(thread), "--reply", str(reply)),
+                "note": "Bash run_in_background로 실행하고 턴을 마칩니다. 명령이 끝나면 다시 호출됩니다"}
+    if re.search(r"^Codex thread:\s*\S+", text, re.M):
+        return {"host": "codex", "note": "턴을 마치고 'Claude 회신 완료: <경로>' queue 메시지를 기다립니다"}
+    return {"warning": "요청서 헤더에 Completion marker 또는 Codex thread가 없어 완료 알림을 받을 수 없습니다"}
+
+
+def self_command(*args):
+    return shlex.join(["python3", str(Path(__file__).resolve()), *args])
 
 
 def check_thread(thread):
     p = Path(thread)
-    if not p.is_absolute() or not p.is_dir() or not (p.parent / "RULES.md").is_file():
-        fail(f"thread는 comm RULES.md 아래 존재하는 절대경로여야 합니다: {thread}")
+    if not p.is_absolute() or not p.is_dir():
+        fail(f"thread는 존재하는 절대경로 폴더여야 합니다: {thread}")
     return p.resolve()
 
 
@@ -156,9 +205,8 @@ def read_saved_record(thread, env=None, handle=None):
 
 
 def recovery_hint(thread, env, handle):
-    command = shlex.join([str(Path(__file__).resolve()), "mark-closed", "--env", env,
-                          "--handle", handle, "--thread", str(thread), "--closed-by-user",
-                          "--reason", "<직접 종료를 확인한 사유>"])
+    command = self_command("mark-closed", "--env", env, "--handle", handle, "--thread", str(thread),
+                           "--closed-by-user", "--reason", "<직접 종료를 확인한 사유>")
     return ("원래 worker의 종료를 직접 확인하세요. 남아 있으면 Orca/tmux에서 직접 닫은 뒤 "
             "기록만 정리하세요(terminal을 자동 조작하지 않음): " + command)
 
@@ -348,12 +396,16 @@ def cmd_start(a):
     ws = ws.resolve()
     request = check_request(a.request)
     thread = Path(request).parent
+    worktree = read_worktree(thread)
+    if worktree and (worktree["status"] != "active" or Path(worktree["workspace"]) != ws):
+        fail(f"이 thread의 worker는 worktree에서 시작해야 합니다: --workspace {worktree['workspace']}"
+             if worktree["status"] == "active" else f"이 thread의 worktree는 이미 정리되었습니다({worktree['status']})")
     previous_raw = None
     if record_path(thread).exists() or record_path(thread).is_symlink():
         previous, previous_raw = read_saved_record(thread)
         if previous.get("status") != "closed":
-            close_command = shlex.join([str(Path(__file__).resolve()), "close", "--env", previous["env"],
-                                        "--handle", previous["handle"], "--thread", str(thread)])
+            close_command = self_command("close", "--env", previous["env"],
+                                         "--handle", previous["handle"], "--thread", str(thread))
             fail("이 thread에 아직 닫히지 않은 worker 기록이 이미 있습니다. 먼저 close하세요: "
                  + close_command)
     cli = shutil.which(a.worker)
@@ -402,7 +454,8 @@ def cmd_start(a):
                 verify_worker(thread, a.env, handle)
                 mark_sending(record)
             sent = send_orca(handle, line, a.dry_run)
-            result = {"env": a.env, "handle": handle, "sent": line, "send_result": sent}
+            result = {"env": a.env, "handle": handle, "sent": line, "send_result": sent,
+                      "next_step": next_step(request)}
         else:
             slug = lambda text: re.sub(r"[^A-Za-z0-9_-]+", "-", text).strip("-")[:24]
             name = "-".join(part for part in ["collab", slug(ws.name), slug(a.title), secrets.token_hex(3)] if part)
@@ -424,7 +477,7 @@ def cmd_start(a):
             tmux_type(handle, f"cd {shlex.quote(str(ws))} && exec {shlex.join([cli, *extra, line])}", a.dry_run)
             sent = None
             result = {"env": a.env, "handle": handle, "session": name, "sent": line,
-                      "attach": f"tmux attach -t {shlex.quote('=' + name)}"}
+                      "attach": f"tmux attach -t {shlex.quote('=' + name)}", "next_step": next_step(request)}
         if record:
             result["send_summary"] = update_sent(record, sent, line)
             result["record"] = str(record_path(thread))
@@ -488,7 +541,7 @@ def cmd_send(a):
         if not a.dry_run:
             summary = update_sent(record, sent, line)
             emit({"env": a.env, "handle": a.handle, "sent": line,
-                  "send_result": sent, "send_summary": summary})
+                  "send_result": sent, "send_summary": summary, "next_step": next_step(request)})
     except (WorkerError, OSError) as error:
         if not a.dry_run:
             record.update(status="failed", error=str(error))
@@ -539,9 +592,338 @@ def cmd_mark_closed(a):
           "terminal_modified": False, "reason": reason})
 
 
+def git_exclude(path):
+    """path가 git 저장소 안이고 아직 무시되지 않으면 그 저장소의 .git/info/exclude에 추가한다."""
+    try:
+        top = subprocess.run(["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True)
+    except OSError:
+        return None
+    if top.returncode:
+        return None
+    top = Path(top.stdout.strip()).resolve()
+    if path == top:
+        return None
+    rel = path.relative_to(top).as_posix()
+    if subprocess.run(["git", "-C", str(top), "check-ignore", "-q", "--no-index", rel]).returncode == 0:
+        return None
+    exclude = subprocess.run(["git", "-C", str(top), "rev-parse", "--git-path", "info/exclude"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    exclude = (top / exclude) if not Path(exclude).is_absolute() else Path(exclude)
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a") as stream:
+        stream.write(f"/{rel}\n")
+    return str(exclude)
+
+
+def git(cwd, *args, check=True):
+    result = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    if check and result.returncode:
+        fail(f"git 실패({result.returncode}): git -C {shlex.quote(str(cwd))} {shlex.join(args)}\n"
+             f"{(result.stderr or result.stdout).strip()}", 1)
+    return result.stdout.strip() if check else result
+
+
+def worktree_path(thread):
+    return Path(thread) / WORKTREE_NAME
+
+
+def read_worktree(thread):
+    path = worktree_path(thread)
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        fail(f"worktree 기록을 읽을 수 없습니다: {path}: {error}")
+    if not isinstance(data, dict) or data.get("version") != 1 or data.get("thread") != str(Path(thread).resolve()):
+        fail(f"worktree 기록이 이 thread와 맞지 않습니다: {path}")
+    return data
+
+
+def save_worktree(data):
+    path = worktree_path(data["thread"])
+    temp = path.with_name("." + WORKTREE_NAME + ".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    os.replace(temp, path)
+
+
+def create_worktree(thread, ws, root):
+    """ws가 속한 저장소의 HEAD에서 작업 branch와 worktree를 만든다. 원래 작업 트리는 바꾸지 않는다."""
+    top = git(ws, "rev-parse", "--show-toplevel", check=False)
+    if top.returncode:
+        fail(f"--worktree는 git 저장소 안의 workspace에서만 쓸 수 있습니다: {ws}")
+    top = Path(top.stdout.strip()).resolve()
+    base_branch = git(top, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    if base_branch.returncode:
+        fail("원래 작업 트리가 branch가 아닌 commit(detached HEAD)에 있어 나중에 합칠 branch를 정할 수 없습니다")
+    base_branch = base_branch.stdout.strip()
+    branch = BRANCH_PREFIX + thread.name
+    if git(top, "check-ref-format", "--branch", branch, check=False).returncode:
+        fail(f"thread 이름으로 branch를 만들 수 없습니다: {branch}")
+    if git(top, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
+        fail(f"작업 branch가 이미 있습니다: {branch}")
+    root = Path(root) if root else top.parent / f"{top.name}.worktrees"
+    if not root.is_absolute():
+        fail(f"worktree 폴더는 절대경로여야 합니다: {root}")
+    path = root / thread.name
+    if path.exists():
+        fail(f"worktree 폴더가 이미 있습니다: {path}")
+    base_commit = git(top, "rev-parse", "HEAD")
+    root.mkdir(parents=True, exist_ok=True)
+    git(top, "worktree", "add", "-b", branch, str(path), base_commit)
+    path = path.resolve()
+    data = {"version": 1, "thread": str(thread), "status": "active", "repo": str(top),
+            "base_branch": base_branch, "base_commit": base_commit, "branch": branch, "path": str(path),
+            "workspace": str(path / ws.relative_to(top)),
+            "base_dirty": bool(git(top, "status", "--porcelain")),
+            "created_at": datetime.now(timezone.utc).isoformat()}
+    save_worktree(data)
+    return data
+
+
+def cmd_thread(a):
+    ws = Path(a.workspace)
+    if not ws.is_absolute() or not ws.is_dir():
+        fail(f"workspace는 존재하는 절대경로여야 합니다: {a.workspace}")
+    ws = ws.resolve()
+    comm = Path(a.comm_dir) if a.comm_dir else ws / ".comm"
+    if not comm.is_absolute():
+        fail(f"comm dir은 절대경로여야 합니다: {a.comm_dir}")
+    topic = re.sub(r"[^\w-]+", "-", a.topic).strip("-")
+    if not topic:
+        fail(f"thread 주제가 비어 있습니다: {a.topic!r}")
+    if a.worktree_dir and not a.worktree:
+        fail("--worktree-dir은 --worktree와 함께 씁니다")
+    thread = comm / f"{datetime.now().strftime('%Y%m%d')}-{topic}"
+    if thread.exists() and not a.existing:
+        fail(f"thread가 이미 있습니다. 이어 쓰려면 --existing을 붙이세요: {thread}")
+    created = not thread.exists()
+    thread.mkdir(parents=True, exist_ok=True)
+    thread = thread.resolve()
+    comm = comm.resolve()
+    excluded = git_exclude(comm)
+    worktree = read_worktree(thread)
+    if a.worktree and worktree is None:
+        try:
+            worktree = create_worktree(thread, ws, a.worktree_dir)
+        except WorkerError:
+            if created:
+                thread.rmdir()
+            raise
+    snapshot = snapshot_rules(thread)
+    rules = thread / RULES_SNAPSHOT
+    result = {"thread": str(thread), "comm_dir": str(comm), "git_exclude": excluded,
+              "rules": str(rules / RULES.name), "templates": str(rules / TEMPLATES.name),
+              "rules_snapshot": snapshot,
+              "worker_workspace": worktree["workspace"] if worktree else str(ws)}
+    if worktree:
+        result["worktree"] = {key: worktree[key] for key in
+                              ("path", "branch", "base_branch", "base_commit", "base_dirty", "status")}
+    emit(result)
+
+
+def thread_records(comm):
+    for thread in sorted(path for path in Path(comm).iterdir() if path.is_dir()):
+        try:
+            record = read_saved_record(thread)[0] if record_path(thread).is_file() else None
+        except WorkerError as error:
+            record = {"error": str(error)}
+        try:
+            worktree = read_worktree(thread)
+        except WorkerError as error:
+            worktree = {"error": str(error)}
+        yield thread, record, worktree
+
+
+def cmd_status(a):
+    """comm dir의 thread별 worker·worktree 기록을 보여 준다. terminal은 조회하지 않는다."""
+    comm = Path(a.comm_dir) if a.comm_dir else Path(a.workspace or "") / ".comm"
+    if not comm.is_absolute():
+        fail("--workspace 또는 --comm-dir 절대경로가 필요합니다")
+    if not comm.is_dir():
+        emit({"comm_dir": str(comm), "threads": []})
+        return
+    comm = comm.resolve()
+    threads = []
+    for thread, record, worktree in thread_records(comm):
+        worker_open = bool(record) and record.get("status") not in {"closed", None}
+        worktree_active = bool(worktree) and worktree.get("status") == "active"
+        if not a.all and not worker_open and not worktree_active:
+            continue
+        item = {"thread": str(thread)}
+        if record:
+            item["worker"] = {key: record.get(key) for key in
+                              ("env", "handle", "worker", "workspace", "request", "status", "stage", "error")
+                              if record.get(key) is not None}
+        if worktree:
+            item["worktree"] = {key: worktree.get(key) for key in
+                                ("path", "branch", "base_branch", "status", "error") if worktree.get(key)}
+        threads.append(item)
+    emit({"comm_dir": str(comm), "threads": threads,
+          "note": "기록 기준입니다. terminal 생존은 read·wait로 확인합니다"})
+
+
+def worktree_for_finish(a):
+    thread = check_thread(a.thread)
+    data = read_worktree(thread)
+    if data is None:
+        fail(f"이 thread에는 worktree 기록이 없습니다: {thread}")
+    if data["status"] != "active":
+        fail(f"이미 정리된 worktree입니다({data['status']}): {data['path']}")
+    if record_path(thread).exists():
+        record, _ = read_saved_record(thread)
+        if record.get("status") != "closed":
+            fail("worker가 아직 열려 있습니다. worktree를 정리하기 전에 close하세요: "
+                 + self_command("close", "--env", record["env"], "--handle", record["handle"],
+                                "--thread", str(thread)))
+    return thread, data
+
+
+def branch_commits(repo, base, branch):
+    out = git(repo, "log", "--format=%H %s", f"{base}..{branch}")
+    return [line for line in out.splitlines() if line]
+
+
+def remove_worktree(data, force=False):
+    """호출 전에 branch가 합쳐졌거나 버려도 되는지 확인해야 한다."""
+    if Path(data["path"]).exists():
+        git(data["repo"], "worktree", "remove", *(["--force"] if force else []), data["path"])
+    git(data["repo"], "worktree", "prune")
+    git(data["repo"], "branch", "-D", data["branch"])
+
+
+def cmd_integrate(a):
+    """PASS 후 작업 branch를 원래 branch 위로 rebase하고 fast-forward로 합친 뒤 worktree를 지운다."""
+    thread, data = worktree_for_finish(a)
+    repo, path, base, branch = data["repo"], data["path"], data["base_branch"], data["branch"]
+    dirty = git(path, "status", "--porcelain")
+    if dirty:
+        fail("worktree에 commit하지 않은 변경이 있습니다. 이번 작업 파일을 commit하거나 사용자에게 확인하세요:\n" + dirty)
+    if not branch_commits(repo, base, branch):
+        fail(f"{branch}에 {base}보다 앞선 commit이 없습니다. 합칠 것이 없으면 사용자 확인 후 discard하세요")
+    rebase = git(path, "rebase", base, check=False)
+    if rebase.returncode:
+        conflicts = git(path, "diff", "--name-only", "--diff-filter=U", check=False).stdout.split()
+        git(path, "rebase", "--abort", check=False)
+        emit({"status": "conflict", "thread": str(thread), "branch": branch, "base_branch": base,
+              "conflicts": conflicts, "worktree": path,
+              "note": "rebase를 취소해 worktree와 branch를 원래 상태로 두었습니다. 사용자에게 보고하세요"})
+        return 5
+    commits = branch_commits(repo, base, branch)
+    current = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip()
+    if current == base:
+        git(repo, "merge", "--ff-only", branch)
+    else:
+        # 원래 branch가 checkout되어 있지 않으면 fast-forward일 때만 ref를 옮긴다.
+        git(repo, "fetch", ".", f"{branch}:{base}")
+    head = git(repo, "rev-parse", base)
+    if head != git(repo, "rev-parse", branch):
+        fail(f"{base}가 {branch}와 같은 commit을 가리키지 않아 worktree를 지우지 않았습니다", 1)
+    remove_worktree(data)
+    data.update(status="integrated", integrated_head=head, integrated_commits=commits,
+                finished_at=datetime.now(timezone.utc).isoformat())
+    save_worktree(data)
+    emit({"status": "integrated", "thread": str(thread), "base_branch": base, "head": head,
+          "commits": commits, "removed_worktree": path, "deleted_branch": branch})
+
+
+def cmd_discard(a):
+    """사용자 확인 후 worktree와 작업 branch를 지운다. 남은 변경·commit은 --force 없이는 지우지 않는다."""
+    thread, data = worktree_for_finish(a)
+    dirty = git(data["path"], "status", "--porcelain") if Path(data["path"]).is_dir() else ""
+    commits = branch_commits(data["repo"], data["base_branch"], data["branch"])
+    if (dirty or commits) and not a.force:
+        emit({"status": "refused", "thread": str(thread), "uncommitted": dirty.splitlines(),
+              "unmerged_commits": commits,
+              "note": "지울 변경이 남아 있습니다. 사용자가 버리기로 확인한 경우에만 --force로 다시 실행하세요"})
+        return 2
+    remove_worktree(data, force=bool(dirty or commits))
+    data.update(status="discarded", discarded_commits=commits,
+                finished_at=datetime.now(timezone.utc).isoformat())
+    save_worktree(data)
+    emit({"status": "discarded", "thread": str(thread), "removed_worktree": data["path"],
+          "deleted_branch": data["branch"], "discarded_commits": commits,
+          "discarded_uncommitted": dirty.splitlines()})
+
+
+def worker_alive(record):
+    try:
+        verify_worker(record["thread"], record["env"], record["handle"])
+        return True, None
+    except (WorkerError, OSError) as error:
+        return False, str(error)
+
+
+def cmd_wait(a):
+    """완료 표시(<회신>.done)가 생길 때까지 기다린다. Claude host가 background로 실행한다."""
+    thread = check_thread(a.thread)
+    reply = Path(a.reply)
+    if not reply.is_absolute() or reply.parent.resolve() != thread:
+        fail(f"회신 경로는 thread 안의 절대경로여야 합니다: {a.reply}")
+    done = reply.parent.resolve() / (reply.name + DONE_SUFFIX)
+    started = time.monotonic()
+    last_check = started
+    failures = 0
+    while True:
+        if done.exists():
+            emit({"status": "done", "reply": str(reply), "reply_exists": reply.exists(),
+                  "marker": str(done)})
+            return 0
+        now = time.monotonic()
+        if a.timeout and now - started >= a.timeout:
+            emit({"status": "timeout", "reply": str(reply), "reply_exists": reply.exists(),
+                  "waited_seconds": int(now - started)})
+            return 4
+        if a.check_worker and now - last_check >= a.check_every:
+            last_check = now
+            try:
+                record, _ = read_saved_record(thread)
+            except WorkerError:
+                record = None
+            if record and record.get("status") != "closed":
+                alive, error = worker_alive(record)
+                failures = 0 if alive else failures + 1
+                # 순간적인 조회 실패로 깨우지 않도록 연속 2회 실패해야 알린다.
+                if failures >= 2:
+                    emit({"status": "worker-unavailable", "reply": str(reply),
+                          "reply_exists": reply.exists(), "handle": record["handle"], "error": error})
+                    return 3
+        time.sleep(a.interval)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("thread", help="comm dir 아래 새 thread 폴더를 만들고 RULES·템플릿 경로를 알려 준다")
+    p.add_argument("--workspace", required=True)
+    p.add_argument("--topic", required=True)
+    p.add_argument("--comm-dir", help="기본값 <workspace>/.comm")
+    p.add_argument("--existing", action="store_true", help="같은 날짜·주제 thread가 있으면 그대로 쓴다")
+    p.add_argument("--worktree", action="store_true",
+                   help="저장소 HEAD에서 작업 branch(collab/<thread>)와 별도 worktree를 만든다")
+    p.add_argument("--worktree-dir", help="worktree를 둘 폴더, 기본값 <저장소>.worktrees")
+    p.set_defaults(fn=cmd_thread)
+    p = sub.add_parser("status", help="comm dir의 열린 worker·worktree 기록을 보여 준다")
+    p.add_argument("--workspace")
+    p.add_argument("--comm-dir", help="기본값 <workspace>/.comm")
+    p.add_argument("--all", action="store_true", help="닫힌 thread도 보여 준다")
+    p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("integrate", help="PASS한 worktree branch를 rebase 후 fast-forward로 합치고 정리한다")
+    p.add_argument("--thread", required=True)
+    p.set_defaults(fn=cmd_integrate)
+    p = sub.add_parser("discard", help="사용자 확인 후 worktree와 작업 branch를 지운다")
+    p.add_argument("--thread", required=True)
+    p.add_argument("--force", action="store_true", help="남은 변경·commit도 버린다(사용자 확인 필수)")
+    p.set_defaults(fn=cmd_discard)
+    p = sub.add_parser("wait", help="<회신>.done 완료 표시를 기다린다(Claude host가 background로 실행)")
+    p.add_argument("--thread", required=True)
+    p.add_argument("--reply", required=True)
+    p.add_argument("--interval", type=float, default=5)
+    p.add_argument("--timeout", type=float, default=0, help="초, 0이면 무제한")
+    p.add_argument("--check-every", type=float, default=60, help="worker terminal 생존 확인 간격(초)")
+    p.add_argument("--no-check-worker", dest="check_worker", action="store_false")
+    p.set_defaults(fn=cmd_wait)
     p = sub.add_parser("start", help="전용 worker를 만들고 thread에 생성 기록을 남긴다")
     p.add_argument("--env", choices=["orca", "tmux"], required=True)
     p.add_argument("--worker", choices=["claude", "codex"], required=True)
@@ -575,14 +957,13 @@ def main():
     p.set_defaults(fn=cmd_mark_closed)
     args = parser.parse_args()
     try:
-        args.fn(args)
+        return args.fn(args) or 0
     except WorkerError as error:
-        print(f"collab-worker: {error}", file=sys.stderr)
+        print(f"collab: {error}", file=sys.stderr)
         return error.code
     except OSError as error:
-        print(f"collab-worker: {error}", file=sys.stderr)
+        print(f"collab: {error}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":
