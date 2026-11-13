@@ -44,6 +44,19 @@ In the host session, describe the work and ask for collaboration, for example "u
   - **Codex host:** the worker notifies the host thread with `codex queue`.
 - **Verify and wrap up:** the host independently verifies the reply and the actual changes. If something is wrong, it asks the same worker for a fix. After PASS, it wraps up according to the commit owner in the request, then closes the worker terminal.
 
+### Running several tasks at once
+
+If you ask for several tasks at once, or ask for a new one while another is running, the host gives each task its own thread and worker and runs them in parallel. It verifies replies one at a time, in the order they arrive.
+
+The host proposes a workspace for each task during planning, and you approve it.
+
+| Workspace | When | Wrap-up |
+|---|---|---|
+| Same tree | The task's files don't overlap with other open tasks. The request lists the files the worker may change; the worker stops and asks before touching anything else | Commit only that task's files |
+| Worktree | Files overlap, shared files (lock files, config) are involved, or tests could interfere. The host creates a task branch (`collab/<thread>`) in `<repo>.worktrees/` next to the repository | Commit in the worktree, rebase onto the original branch, and fast-forward. On conflict, leave everything as is and report to you |
+
+A worktree does not contain uncommitted changes from the original working tree or ignored files (such as `node_modules`). The host puts any setup commands the worker needs in the request.
+
 The canonical procedure is [skills/collaborate/RULES.md](skills/collaborate/RULES.md), and the request and reply forms are in [skills/collaborate/templates/](skills/collaborate/templates/). The worker reads the absolute `RULES.md` path given in its request line.
 
 ## Requirements

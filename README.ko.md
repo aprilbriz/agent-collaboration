@@ -42,6 +42,19 @@ host 세션에서 하고 싶은 일을 말하고 협업을 요청합니다. 예:
   - **Codex host:** worker가 `codex queue`로 host thread에 알립니다.
 - **검증·마무리:** host가 회신과 실제 변경을 독립 검증합니다. 문제가 있으면 같은 worker에 수정을 요청하고, PASS 뒤에는 요청서의 commit 주체에 따라 마무리합니다. 마지막에 worker terminal을 닫습니다.
 
+### 여러 작업 동시에 하기
+
+여러 작업을 한 번에 요청하거나 진행 중에 새 작업을 요청하면, host가 작업마다 thread와 worker를 따로 띄워 병렬로 진행합니다. 회신은 도착하는 순서대로 하나씩 검증합니다.
+
+작업 공간은 계획 단계에서 host가 작업마다 제안하고, 사용자가 승인합니다.
+
+| 작업 공간 | 언제 | 마무리 |
+|---|---|---|
+| 같은 트리 | 다른 작업과 수정 파일이 겹치지 않을 때. 요청서에 수정 가능 범위를 적고, 범위 밖은 worker가 멈춰 질문 | 작업별로 해당 파일만 commit |
+| worktree | 파일이 겹치거나, 공통 파일(lock·설정)을 건드리거나, 테스트끼리 간섭할 수 있을 때. 저장소 옆 `<저장소>.worktrees/`에 작업 branch(`collab/<thread>`)를 만듦 | worktree에서 commit한 뒤 원래 branch 위로 rebase하고 fast-forward로 합침. 충돌하면 그대로 두고 사용자에게 보고 |
+
+worktree에는 원래 작업 트리의 commit하지 않은 변경과 무시된 파일(`node_modules` 등)이 없습니다. 필요한 준비 명령은 host가 요청서에 적습니다.
+
 절차 정본은 [skills/collaborate/RULES.md](skills/collaborate/RULES.md)이고, 요청·회신 양식은 [skills/collaborate/templates/](skills/collaborate/templates/)에 있습니다. worker는 요청 한 줄에 적힌 `RULES.md` 절대경로를 읽습니다.
 
 ## 실행 전제

@@ -72,7 +72,8 @@ class DocsTest(unittest.TestCase):
     def test_skill_commands_use_existing_subcommands(self):
         text = (SKILL / "SKILL.md").read_text()
         used = set(re.findall(r'collab\.py" (\w[\w-]*)', text))
-        self.assertEqual(used, {"thread", "start", "wait", "send", "read", "close"})
+        self.assertEqual(used, {"thread", "status", "start", "wait", "send", "read", "close",
+                                "integrate", "discard"})
         help_text = run_collab("--help").stdout
         for command in used | {"mark-closed"}:
             self.assertIn(command, help_text)
@@ -165,6 +166,162 @@ class ThreadTest(unittest.TestCase):
                 result = run_collab("thread", *args)
                 self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(list(self.ws.iterdir()), [])
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+class WorktreeTest(unittest.TestCase):
+    """병렬 작업용 worktree 생성·상태·합치기·버리기를 실제 git으로 확인한다."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="collab worktree-")
+        self.root = Path(self.directory.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.email", "t@example.com")
+        git(self.repo, "config", "user.name", "t")
+        (self.repo / "a.txt").write_text("a\n")
+        git(self.repo, "add", "a.txt")
+        git(self.repo, "commit", "-qm", "init")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def thread(self, topic, *extra):
+        result = run_collab("thread", "--workspace", self.repo, "--topic", topic, "--worktree", *extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def commit_in(self, path, name, text):
+        (Path(path) / name).write_text(text)
+        git(path, "add", name)
+        git(path, "commit", "-qm", f"add {name}")
+
+    def test_thread_creates_branch_and_sibling_worktree(self):
+        data = self.thread("task one")
+        tree = data["worktree"]
+        self.assertEqual(Path(tree["path"]).parent, self.root / "repo.worktrees")
+        self.assertEqual(tree["branch"], "collab/" + Path(data["thread"]).name)
+        self.assertEqual(tree["base_branch"], "main")
+        self.assertFalse(tree["base_dirty"])
+        self.assertEqual(data["worker_workspace"], tree["path"])
+        self.assertEqual(Path(data["thread"]).parent, self.repo / ".comm")
+        self.assertTrue((Path(tree["path"]) / "a.txt").is_file())
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        self.assertEqual(git(tree["path"], "status", "--porcelain"), "")  # .comm 제외가 worktree에도 적용된다
+
+    def test_subdirectory_workspace_maps_into_worktree(self):
+        (self.repo / "pkg").mkdir()
+        self.commit_in(self.repo / "pkg", "b.txt", "b\n")
+        result = run_collab("thread", "--workspace", self.repo / "pkg", "--topic", "sub", "--worktree")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["worker_workspace"], str(Path(data["worktree"]["path"]) / "pkg"))
+
+    def test_refuses_outside_git_and_detached_head_without_leaving_thread(self):
+        plain = self.root / "plain"
+        plain.mkdir()
+        result = run_collab("thread", "--workspace", plain, "--topic", "x", "--worktree")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(list((plain / ".comm").iterdir()), [])
+        git(self.repo, "checkout", "-q", "--detach")
+        result = run_collab("thread", "--workspace", self.repo, "--topic", "y", "--worktree")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("detached", result.stderr)
+
+    def test_start_requires_the_worktree_workspace(self):
+        data = self.thread("start check")
+        request = Path(data["thread"]) / "01-claude-request.md"
+        request.write_text("req")
+        result = run_collab("start", "--env", "tmux", "--worker", "codex", "--workspace", self.repo,
+                            "--request", request, "--title", "t", "--dry-run")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(data["worker_workspace"], result.stderr)
+
+    def test_integrate_rebases_onto_moved_base_and_cleans_up(self):
+        first = self.thread("first")
+        second = self.thread("second")
+        self.commit_in(first["worktree"]["path"], "one.txt", "1\n")
+        self.commit_in(second["worktree"]["path"], "two.txt", "2\n")
+        for data in (first, second):
+            result = run_collab("integrate", "--thread", data["thread"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            out = json.loads(result.stdout)
+            self.assertEqual(out["status"], "integrated")
+            self.assertFalse(Path(data["worktree"]["path"]).exists())
+        self.assertTrue((self.repo / "one.txt").is_file() and (self.repo / "two.txt").is_file())
+        self.assertEqual(git(self.repo, "rev-list", "--merges", "--count", "HEAD"), "0")  # 일직선 이력
+        self.assertEqual(git(self.repo, "branch", "--list", "collab/*"), "")
+        self.assertEqual(json.loads(run_collab("status", "--workspace", self.repo).stdout)["threads"], [])
+        again = run_collab("integrate", "--thread", first["thread"])
+        self.assertEqual(again.returncode, 2)
+
+    def test_integrate_conflict_aborts_and_keeps_everything(self):
+        data = self.thread("conflict")
+        tree = data["worktree"]["path"]
+        self.commit_in(tree, "a.txt", "worker\n")
+        self.commit_in(self.repo, "a.txt", "base moved\n")
+        before = git(tree, "rev-parse", "HEAD")
+        result = run_collab("integrate", "--thread", data["thread"])
+        self.assertEqual(result.returncode, 5, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertEqual(out["status"], "conflict")
+        self.assertEqual(out["conflicts"], ["a.txt"])
+        self.assertEqual(git(tree, "rev-parse", "HEAD"), before)
+        self.assertEqual(git(tree, "status", "--porcelain"), "")
+        self.assertEqual((self.repo / "a.txt").read_text(), "base moved\n")
+
+    def test_integrate_refuses_uncommitted_changes_open_worker_and_empty_branch(self):
+        data = self.thread("guards")
+        tree = Path(data["worktree"]["path"])
+        empty = run_collab("integrate", "--thread", data["thread"])
+        self.assertEqual(empty.returncode, 2)
+        self.assertIn("discard", empty.stderr)
+        (tree / "new.txt").write_text("x")
+        dirty = run_collab("integrate", "--thread", data["thread"])
+        self.assertEqual(dirty.returncode, 2)
+        self.assertIn("new.txt", dirty.stderr)
+        record = collab.new_record(data["thread"], "tmux", "%1", "codex", tree, "/r.md")
+        collab.save_record(record)
+        opened = run_collab("integrate", "--thread", data["thread"])
+        self.assertEqual(opened.returncode, 2)
+        self.assertIn("close", opened.stderr)
+
+    def test_integrate_when_base_branch_is_not_checked_out(self):
+        data = self.thread("other branch")
+        self.commit_in(data["worktree"]["path"], "x.txt", "x\n")
+        git(self.repo, "checkout", "-q", "-b", "side")
+        result = run_collab("integrate", "--thread", data["thread"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(git(self.repo, "show", "main:x.txt"), "x")
+        self.assertEqual(git(self.repo, "symbolic-ref", "--short", "HEAD"), "side")
+
+    def test_discard_refuses_work_without_force(self):
+        data = self.thread("discard")
+        tree = data["worktree"]["path"]
+        self.commit_in(tree, "keep.txt", "k\n")
+        refused = run_collab("discard", "--thread", data["thread"])
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(len(json.loads(refused.stdout)["unmerged_commits"]), 1)
+        self.assertTrue(Path(tree).exists())
+        forced = run_collab("discard", "--thread", data["thread"], "--force")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertFalse(Path(tree).exists())
+        self.assertEqual(git(self.repo, "branch", "--list", "collab/*"), "")
+        self.assertFalse((self.repo / "keep.txt").exists())
+
+    def test_status_lists_open_workers_and_active_worktrees(self):
+        same = run_collab("thread", "--workspace", self.repo, "--topic", "same tree")
+        same = json.loads(same.stdout)
+        collab.save_record(collab.new_record(same["thread"], "tmux", "%7", "codex", self.repo, "/r.md"))
+        tree = self.thread("tree")
+        threads = json.loads(run_collab("status", "--workspace", self.repo).stdout)["threads"]
+        by_thread = {item["thread"]: item for item in threads}
+        self.assertEqual(by_thread[same["thread"]]["worker"]["handle"], "%7")
+        self.assertEqual(by_thread[tree["thread"]]["worktree"]["status"], "active")
 
 
 class WaitTest(unittest.TestCase):

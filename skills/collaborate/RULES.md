@@ -47,6 +47,8 @@ worker는 요청 한 줄에 적힌 이 파일의 절대경로를 읽는다. 아�
 - **대상 저장소**: 실제로 변경·검증·commit하는 저장소. workspace와 다르면 worker는 그 저장소의 `AGENTS.md`·`CLAUDE.md`도 읽는다.
 - **comm dir**: thread를 모아 두는 통신 폴더. 기본값은 `<workspace>/.comm`이며 thread는 `<comm dir>/<YYYYMMDD>-<주제>/`다.
   `collab.py thread`가 폴더를 만들고, git 저장소 안이면 그 저장소의 `.git/info/exclude`에 추가한다(추적 파일은 바꾸지 않음).
+- **worktree**: 병렬 작업을 격리할 때 `collab.py thread --worktree`가 대상 저장소 HEAD에서 만드는 작업 branch(`collab/<thread>`)와 폴더.
+  기본 위치는 저장소 옆 `<저장소>.worktrees/<thread>`다. 이때 worker의 workspace·git·테스트 cwd는 worktree 안이고, thread는 원래 comm dir에 둔다.
 - 요청서에는 세 경로와 git·테스트 명령의 cwd를 절대경로로 적는다. worker 시작 위치는 workspace로 유지한다.
 - host는 자기 시작 위치·로드한 지침을 workspace·대상 저장소와 대조하고, 다르면 해당 지침을 읽어 차이와 적용 규칙을 요청서에 인계한다.
   시작 위치가 같아도 CLI별 skill·메모리가 같다고 가정하지 않는다.
@@ -83,6 +85,23 @@ worker는 요청 한 줄에 적힌 이 파일의 절대경로를 읽는다. 아�
 - host는 요청 전달 후 진행 상태를 알리고 턴을 마친다. 알림·대기 종료로 시작된 턴에서 회신을 읽고 검증한다.
 - worker가 작업하는 동안 host는 같은 작업 트리를 수정하거나 worker가 쓰는 terminal을 조작하지 않는다.
 - 최종 검증이 끝나면 `collab.py close`로 전용 worker를 닫는다.
+
+### 4.1 병렬 작업
+
+- 작업 하나에 thread 하나, thread 하나에 worker 하나를 둔다. 진행 중에 새 작업을 요청받으면 새 thread를 연다.
+  한 thread에 다른 작업을 섞거나 worker를 둘 이상 두지 않는다. 열린 작업은 `collab.py status`로 확인한다.
+- host는 계획 단계에서 작업마다 작업 공간을 제안하고 사용자 승인을 받는다.
+  - **같은 트리**: 단독 작업이거나, 열린 다른 작업과 수정 파일이 겹치지 않고 공통 파일(lock·설정·생성물)을 건드리지 않으며,
+    동시에 돌려도 서로의 테스트·빌드 결과에 영향이 없을 때. 요청서에 수정 가능 범위를 적는다.
+  - **worktree**: 위 조건 중 하나라도 맞지 않을 때. worktree에는 원래 작업 트리의 commit하지 않은 변경과
+    무시된 파일(의존성·빌드 산출물)이 없으므로, 필요한 준비 명령을 요청서에 적는다.
+- 같은 트리에서 worker는 수정 가능 범위 밖 파일을 바꾸기 전에 멈추고 질문한다. 다른 worker의 진행 중 변경은 건드리지 않는다.
+- 회신은 도착하는 순서대로 하나씩 검증한다. PASS·commit·정리는 작업마다 따로 한다.
+- worktree 작업의 commit 주체가 host면 PASS 후 worktree 안에서 commit하고 `collab.py integrate`로 합친다.
+  integrate는 작업 branch를 원래 branch 위로 rebase한 뒤 fast-forward로만 합치고, 성공하면 worktree와 branch를 지운다.
+  충돌하면 rebase를 취소하고 그대로 둔다. host는 충돌을 임의로 해결하지 않고 사용자에게 보고한다.
+- commit 주체가 user·없음이면 worktree와 branch를 남기고 위치를 알린다. 취소·폐기는 사용자 확인 후 `collab.py discard`로 하며,
+  남은 변경·commit을 버리는 `--force`는 사용자가 버리기로 확인했을 때만 쓴다.
 
 ## 5. 문서 형식
 
@@ -134,4 +153,4 @@ worker 자체 검증 결과는 본문에 적고 `Verdict`는 `N/A`로 둔다.
 - 회신이 오지 않으면 회신 파일과 worker 화면으로 원인을 확인해 보고한다. 지시 없이 재전송하거나 새 worker를 띄우지 않는다.
 - 완료 알림이 실패하면 worker는 회신 파일을 그대로 두고 실패 출력을 남긴다. 다른 경로로 재전송하지 않는다.
 - Claude host가 대기 중 재시작되면 같은 `collab.py wait`를 다시 background로 실행한다. 완료 표시가 이미 있으면 즉시 끝난다.
-- 사용자가 취소하면 전용 worker를 닫고 그 작업의 임시 파일을 정리한다. 기존 사용자 세션과 변경은 건드리지 않는다.
+- 사용자가 취소하면 전용 worker를 닫고 그 작업의 임시 파일을 정리한다(worktree는 4.1절의 discard). 기존 사용자 세션과 변경은 건드리지 않는다.
