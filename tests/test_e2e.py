@@ -53,7 +53,7 @@ class E2ECleanupTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as stopped:
                     E2E.main()
             self.assertEqual(stopped.exception.code, 1)
-            evidence = root / ".e2e" / "orca-claude-test" / ".comm" / "20261110-e2e" / "02-evidence"
+            [evidence] = (root / ".e2e" / "orca-claude-test" / ".comm").glob("*-e2e/02-evidence")
             self.assertIn("init failed", (evidence / "error.txt").read_text())
             self.assertIn("결과 코드 1", (evidence / "runner.log").read_text())
             self.assertIsNone(E2E.RUN_LOG)

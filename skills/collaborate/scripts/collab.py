@@ -31,7 +31,8 @@ BRANCH_PREFIX = "collab/"
 HISTORY_DIR = "worker-record-history"
 WORKER_DEFAULT_ARGS = {
     "claude": ["--dangerously-skip-permissions"],
-    "codex": ["--dangerously-bypass-approvals-and-sandbox"],
+    # 업데이트 안내 선택창이 뜨면 아무도 답하지 않는 worker가 멈추므로 시작 시 확인을 끈다(이 실행에만 적용).
+    "codex": ["--dangerously-bypass-approvals-and-sandbox", "-c", "check_for_update_on_startup=false"],
 }
 
 

@@ -65,7 +65,8 @@ The canonical procedure is [skills/collaborate/RULES.md](skills/collaborate/RULE
 - You need `python3`. The helper uses only the standard library.
 - You need `orca` or `tmux`, depending on where the worker runs.
 - Both `codex` and `claude` must have login and workspace trust completed.
-- Dedicated workers run with permission-bypass flags (Claude `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox`).
+- Dedicated workers run with permission-bypass flags (Claude `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox`). Codex workers also get `-c check_for_update_on_startup=false` for that run only, so an update prompt cannot block them.
+- The repository must already be trusted in the worker's CLI. A worker started in a folder it has never trusted stops at the trust prompt. A worktree of a trusted repository is already trusted.
 - Linux is unverified. Native Windows is not supported.
 
 ## Development
